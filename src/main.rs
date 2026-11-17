@@ -3,6 +3,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use murmduck::cli::{Cli, Command};
+use murmduck::session::body::NoopBody;
+use murmduck::session::body::PlaceholderSession;
+use murmduck::session::coordinator::{self, ClientRetry};
+use murmduck::session::paths::RuntimePaths;
 use murmduck::{config, logging, selection};
 
 fn main() -> ExitCode {
@@ -31,29 +35,35 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     dispatch(&config, cli.command)
 }
 
-/// Route a parsed command. `read-selection` reads and validates the PRIMARY
-/// selection; the remaining commands keep their walking-skeleton behaviour
-/// until their own milestones.
+/// Route a parsed command.
+///
+/// `toggle`, `stop` and `status` go through the session coordinator, which
+/// makes exactly one invocation the owner (holding the lock and serving the
+/// control socket) and turns the rest into control clients. `read-selection`
+/// and `test-voice` keep their current behaviour until their own milestones.
 fn dispatch(config: &config::Config, command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        Command::Toggle => {
+            let runtime = RuntimePaths::from_env()?;
+            let timeout = Duration::from_millis(config.selection.timeout_ms);
+            let source = selection::WaylandPrimary::new(timeout);
+            let body = PlaceholderSession::new(source, config.selection.clone());
+            let outcome = coordinator::run(&runtime, command, body, &ClientRetry::default())?;
+            println!("{}", outcome.report());
+        }
+        Command::Stop | Command::Status => {
+            let runtime = RuntimePaths::from_env()?;
+            let outcome = coordinator::run(&runtime, command, NoopBody, &ClientRetry::default())?;
+            println!("{}", outcome.report());
+        }
         Command::ReadSelection => {
             let timeout = Duration::from_millis(config.selection.timeout_ms);
             let source = selection::WaylandPrimary::new(timeout);
             let selected = selection::read_selection(&source, &config.selection)?;
             println!("{}", selection::success_report(&selected));
         }
-        other => {
-            let name = match other {
-                Command::Toggle => "toggle",
-                Command::Stop => "stop",
-                Command::Status => "status",
-                Command::TestVoice => "test-voice",
-                Command::ReadSelection => unreachable!("handled above"),
-            };
-            tracing::info!(
-                command = name,
-                "command accepted; execution arrives in a later milestone"
-            );
+        Command::TestVoice => {
+            tracing::info!("test-voice execution arrives in a later milestone");
         }
     }
     Ok(())
