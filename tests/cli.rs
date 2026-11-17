@@ -65,6 +65,39 @@ fn unknown_command_is_rejected() {
 }
 
 #[test]
+fn read_selection_is_wired_to_the_selection_provider() {
+    // Isolate from any real user config. On the headless CI host this fails
+    // because wl-paste is absent; on the Wayland target it reports a count.
+    // Either way it must no longer be the placeholder command.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let output = murmduck()
+        .arg("read-selection")
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .expect("run binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !combined.contains("later milestone"),
+        "read-selection must run the provider, not the placeholder: {combined:?}"
+    );
+    assert!(
+        combined.contains("PRIMARY selection") || combined.contains("selection provider"),
+        "expected a selection result or provider error: {combined:?}"
+    );
+    if output.status.success() {
+        assert!(
+            combined.contains("characters"),
+            "a successful read must report a character count: {combined:?}"
+        );
+    }
+}
+
+#[test]
 fn invalid_config_fails_with_an_actionable_error() {
     use std::fs;
 
