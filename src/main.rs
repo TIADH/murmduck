@@ -2,9 +2,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use murmduck::audio::AudioSink;
 use murmduck::cli::{Cli, Command};
-use murmduck::session::body::NoopBody;
-use murmduck::session::body::PlaceholderSession;
+use murmduck::session::body::{NoopBody, ReadAloudSession};
 use murmduck::session::coordinator::{self, ClientRetry};
 use murmduck::session::paths::RuntimePaths;
 use murmduck::{config, logging, selection};
@@ -32,7 +32,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!(path = %path.display(), "configuration loaded");
     logging::log_startup(&config, env!("CARGO_PKG_VERSION"), api_key.as_deref());
 
-    dispatch(&config, cli.command)
+    dispatch(&config, cli.command, api_key)
 }
 
 /// Route a parsed command.
@@ -41,13 +41,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// makes exactly one invocation the owner (holding the lock and serving the
 /// control socket) and turns the rest into control clients. `read-selection`
 /// and `test-voice` keep their current behaviour until their own milestones.
-fn dispatch(config: &config::Config, command: Command) -> Result<(), Box<dyn std::error::Error>> {
+fn dispatch(
+    config: &config::Config,
+    command: Command,
+    api_key: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Toggle => {
             let runtime = RuntimePaths::from_env()?;
             let timeout = Duration::from_millis(config.selection.timeout_ms);
             let source = selection::WaylandPrimary::new(timeout);
-            let body = PlaceholderSession::new(source, config.selection.clone());
+            let body = ReadAloudSession::new(
+                source,
+                config.selection.clone(),
+                config.tts.clone(),
+                api_key,
+                AudioSink::Auto,
+            );
             let outcome = coordinator::run(&runtime, command, body, &ClientRetry::default())?;
             println!("{}", outcome.report());
         }

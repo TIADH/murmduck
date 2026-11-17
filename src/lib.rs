@@ -10,3 +10,4 @@ pub mod config;
 pub mod logging;
 pub mod selection;
 pub mod session;
+pub mod tts;

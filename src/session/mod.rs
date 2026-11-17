@@ -9,7 +9,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioError;
 use crate::selection::SelectionError;
+use crate::tts::TtsError;
 
 pub mod body;
 pub mod coordinator;
@@ -31,8 +33,12 @@ pub enum SessionError {
     Protocol(protocol::ProtocolError),
     /// A control client could not reach the owner.
     Client(ipc::ClientError),
-    /// The (placeholder) session body failed, e.g. an empty selection.
+    /// The PRIMARY selection could not be read or validated.
     Selection(SelectionError),
+    /// The TTS request failed (network, HTTP status or stream error).
+    Tts(TtsError),
+    /// The audio pipeline failed while starting, feeding or finishing playback.
+    Audio(AudioError),
     /// Bounded retries were exhausted while looking for a live owner.
     Unavailable { detail: String },
 }
@@ -46,6 +52,8 @@ impl fmt::Display for SessionError {
             Self::Protocol(err) => write!(f, "{err}"),
             Self::Client(err) => write!(f, "{err}"),
             Self::Selection(err) => write!(f, "{err}"),
+            Self::Tts(err) => write!(f, "{err}"),
+            Self::Audio(err) => write!(f, "{err}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }
     }
@@ -74,6 +82,18 @@ impl From<ipc::ClientError> for SessionError {
 impl From<SelectionError> for SessionError {
     fn from(err: SelectionError) -> Self {
         Self::Selection(err)
+    }
+}
+
+impl From<TtsError> for SessionError {
+    fn from(err: TtsError) -> Self {
+        Self::Tts(err)
+    }
+}
+
+impl From<AudioError> for SessionError {
+    fn from(err: AudioError) -> Self {
+        Self::Audio(err)
     }
 }
 
