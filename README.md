@@ -105,15 +105,14 @@ Selected text and API keys are never written to logs; only sizes and a
 
 ## KDE global shortcut
 
-In KDE System Settings → **Shortcuts → Custom Shortcuts**:
-
-1. **Edit → New → Global Shortcut → Command or URL**.
-2. Name it, e.g. *Murmduck: read / stop selection*.
-3. Set the trigger to your preferred combination (for example `Ctrl+Alt+R`).
-4. Set **Command URL** to the absolute path of the installed binary, for
-   example `/home/your-user/.cargo/bin/murmduck toggle` (`$CARGO_HOME/bin/murmduck`).
-5. Apply, then select text in a supported application and press the shortcut.
-   Press it again to stop playback.
+1. Open **Settings → Keyboard → Shortcuts**.
+2. Click **Add New → Command or Script**.
+3. Enter the command and a name, then click **Add**. Use `murmduck toggle` if
+   Cargo's bin directory is on the graphical session's `PATH`, or an absolute
+   path such as `/home/your-user/.cargo/bin/murmduck toggle`.
+4. Select the new command and assign a shortcut, for example `Alt+A`. Then
+   select text in a supported application and press it to start reading; press
+   it again to stop.
 
 An absolute path is recommended because KDE does not necessarily launch commands
 with the `PATH` of an interactive shell. Full details, including how to run

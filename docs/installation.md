@@ -155,22 +155,16 @@ If `CARGO_HOME` is set to something other than `~/.cargo`, use
 
 ## 5. KDE Plasma Custom Shortcut
 
-1. Open **System Settings → Shortcuts → Custom Shortcuts**.
-2. Choose **Edit → New → Global Shortcut → Command or URL**.
-3. Give it a name such as *Murmduck: read / stop selection*.
-4. Under **Trigger**, set your shortcut (for example `Ctrl+Alt+R`). Pick a
-   combination that does not clash with the applications you use.
-5. Under **Action → Command URL**, enter:
-
-   ```
-   /home/your-user/.cargo/bin/murmduck toggle
-   ```
-
-   Use the absolute path of the Cargo-installed binary (`$CARGO_HOME/bin/murmduck`,
-   normally `~/.cargo/bin/murmduck`), or a directory on the graphical session's
-   `PATH`.
-
-6. Click **Apply / OK**.
+1. Open **Settings → Keyboard → Shortcuts**.
+2. Click **Add New → Command or Script**.
+3. Enter the command and a name, then click **Add**. Use `murmduck toggle` if
+   Cargo's bin directory is on the graphical session's `PATH`, or an absolute
+   path such as `/home/your-user/.cargo/bin/murmduck toggle`
+   (`$CARGO_HOME/bin/murmduck`). The `toggle` subcommand is required — running
+   `murmduck` on its own does not start a reading.
+4. Select the command you just created and set its shortcut, for example
+   `Alt+A`. Pick a combination that does not clash with the applications you
+   use.
 
 Usage:
 
