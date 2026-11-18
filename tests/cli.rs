@@ -274,6 +274,59 @@ fn toggle_without_credentials_stops_an_active_owner() {
 }
 
 #[test]
+fn toggle_with_invalid_config_still_stops_an_active_owner() {
+    // A second `toggle` is only a control client: a malformed TOML edit during
+    // playback must not prevent the hotkey from stopping the owner (review
+    // re-review T1). Config is owner-only; the client path needs just the socket.
+    use std::sync::{Arc, Mutex};
+
+    use murmduck::session::SessionControl;
+    use murmduck::session::SessionState;
+    use murmduck::session::ipc::ControlServer;
+    use murmduck::session::lock::InstanceLock;
+    use murmduck::session::paths::RuntimePaths;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = dir.path().join("murmduck");
+    std::fs::create_dir(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("config.toml"), "[tts]\nspeed = 0.0\n")
+        .expect("write deliberately invalid config");
+
+    let runtime = RuntimePaths::new(dir.path().join("runtime").join("murmduck"));
+    let guard = InstanceLock::try_acquire(&runtime.lock)
+        .expect("acquire lock")
+        .expect("become fake owner");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&runtime.socket).expect("bind control socket");
+    let control = SessionControl::new();
+    let mut server = ControlServer::spawn_with_control(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        control.clone(),
+    );
+
+    let output = run_isolated(&["toggle"], dir.path(), std::time::Duration::from_secs(3));
+
+    assert!(
+        output.status.success(),
+        "toggle must reach the owner despite invalid config; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Stopping"),
+        "the owner must be told to stop: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        control.stop_requested(),
+        "the fake owner must have received Stop"
+    );
+
+    server.shutdown();
+    drop(guard);
+}
+
+#[test]
 fn stop_and_status_bypass_an_invalid_config_while_an_owner_is_active() {
     // Control-only commands need only XDG_RUNTIME_DIR and the socket. An
     // invalid TOML edit during playback must not block stopping the owner

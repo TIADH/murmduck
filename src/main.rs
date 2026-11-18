@@ -54,32 +54,52 @@ fn make_body<S: SelectionSource>(
     })
 }
 
-/// Build a fresh reading for each attempt the session owner runs.
+/// Owner-only setup that loads and validates configuration the first time this
+/// invocation actually becomes the session owner.
 ///
-/// The coordinator calls the factory only after this invocation has acquired
-/// the instance lock, so credentials are resolved once per owner — never by a
-/// control client that merely forwards Stop or Status over IPC.
-fn reading_factory(
-    config: &config::Config,
-) -> impl FnMut(ReadingKind) -> Result<AppBody, SessionError> {
-    let config = config.clone();
-    let mut api_key: Option<Option<String>> = None;
-    move |kind| {
-        if api_key.is_none() {
-            let resolved = config.tts.resolve_api_key()?;
-            logging::log_startup(&config, env!("CARGO_PKG_VERSION"), resolved.as_deref());
-            api_key = Some(resolved);
+/// The coordinator invokes the factory only after the instance lock has been
+/// won. A `toggle`/`read-selection`/`test-voice` that finds a live owner is just
+/// a control client: it must not parse (or fail on) a malformed config before
+/// forwarding its command over IPC (review re-review T1). Credentials stay
+/// owner-only for the same reason, and both are cached so a replacement reuses
+/// the same validated config without reloading the file.
+struct OwnerSetup {
+    config: Option<config::Config>,
+    api_key: Option<Option<String>>,
+}
+
+impl OwnerSetup {
+    fn new() -> Self {
+        Self {
+            config: None,
+            api_key: None,
         }
-        let key = api_key.clone().flatten();
+    }
+
+    /// Build a fresh reading for one attempt of the session owner.
+    fn body(&mut self, kind: ReadingKind) -> Result<AppBody, SessionError> {
+        if self.config.is_none() {
+            let path = config::config_path()?;
+            let config = config::Config::load(&path)?;
+            tracing::debug!(path = %path.display(), "configuration loaded");
+            self.config = Some(config);
+        }
+        let config = self.config.as_ref().expect("config loaded above");
+        if self.api_key.is_none() {
+            let resolved = config.tts.resolve_api_key()?;
+            logging::log_startup(config, env!("CARGO_PKG_VERSION"), resolved.as_deref());
+            self.api_key = Some(resolved);
+        }
+        let key = self.api_key.clone().flatten();
         Ok(match kind {
             ReadingKind::Selection => AppBody::Selection(make_body(
-                &config,
+                config,
                 key,
                 WaylandPrimary::new(config.selection.timeout())
                     .with_max_chars(config.selection.max_chars),
             )),
             ReadingKind::TestVoice => AppBody::TestVoice(make_body(
-                &config,
+                config,
                 key,
                 StaticSource::new(selection::TEST_VOICE_SAMPLE),
             )),
@@ -104,9 +124,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // They must keep working when the TOML config has been edited into an
         // invalid state during playback (review re-review N4).
         Command::Stop | Command::Status { .. } => run_control(cli.command),
-        // Commands that can produce audio load and validate config on every
-        // invocation; an invocation that becomes a control client still avoids
-        // credential resolution because the reading factory is owner-only.
+        // These may produce audio, so config and credentials are resolved only
+        // if this invocation actually becomes the owner. An invocation that
+        // routes to a control client needs neither and stays config-independent.
         Command::Toggle | Command::ReadSelection | Command::TestVoice => run_owner(cli.command),
     }
 }
@@ -123,21 +143,19 @@ fn run_control(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Full path for an invocation that may become the session owner.
+///
+/// Logging is installed before role routing so a control-client invocation (the
+/// second `toggle`) can reach a live owner even while the TOML is invalid. All
+/// config/credential work is deferred to [`OwnerSetup`], which the coordinator
+/// only runs once this process has won the lock and is genuinely the owner.
 fn run_owner(command: Command) -> Result<(), Box<dyn std::error::Error>> {
-    let path = config::config_path()?;
-    let config = config::Config::load(&path)?;
-    let level = config.logging.level_filter()?;
-    logging::init(level)?;
-    tracing::debug!(path = %path.display(), "configuration loaded");
-
+    logging::init(LevelFilter::INFO)?;
     let runtime = RuntimePaths::from_env()?;
     let retry = ClientRetry::default();
-    let outcome = coordinator::run_with_fallible_factory(
-        &runtime,
-        command,
-        reading_factory(&config),
-        &retry,
-    )?;
+
+    let mut setup = OwnerSetup::new();
+    let outcome =
+        coordinator::run_with_fallible_factory(&runtime, command, |kind| setup.body(kind), &retry)?;
     print_outcome(command, outcome);
     Ok(())
 }

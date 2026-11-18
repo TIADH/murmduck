@@ -276,6 +276,77 @@ fn a_stop_is_handled_promptly_when_all_worker_slots_hold_trickling_frames() {
 }
 
 #[test]
+fn a_flood_of_incomplete_clients_cannot_delay_a_stop_command() {
+    // Under saturation the at-capacity path must not read frames on the single
+    // accept thread: a queue of stalled clients ahead of a genuine Stop would
+    // otherwise serialize into a multi-second hotkey delay (review T2). Fill the
+    // workers, then queue far more incomplete connections than there are
+    // workers, and require Stop to still be prompt.
+    const WORKERS: usize = 8;
+    const FLOOD: usize = 60;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+    let cancel = Cancellation::new();
+    let mut server = ControlServer::spawn(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        cancel.clone(),
+    );
+
+    // Occupy every worker slot with a partial frame so the following clients
+    // take the at-capacity path.
+    let mut hogs = Vec::new();
+    for _ in 0..WORKERS {
+        let mut stream = UnixStream::connect(&socket).expect("connect hog client");
+        stream
+            .write_all(b"{\"version\":1,\"command\":\"S")
+            .expect("send partial frame");
+        hogs.push(stream);
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    // Queue a large backlog of incomplete connections. Each one must be
+    // rejected without occupying the accept thread for PRIORITY_WAIT.
+    let mut flood = Vec::new();
+    for _ in 0..FLOOD {
+        let mut stream = UnixStream::connect(&socket).expect("connect flood client");
+        stream
+            .write_all(b"{\"version\":1,\"command\":\"S")
+            .expect("send partial frame");
+        flood.push(stream);
+    }
+
+    let started = Instant::now();
+    let options = ClientOptions {
+        attempts: 1,
+        backoff: Duration::from_millis(1),
+    };
+    let ack = ipc::send_command(&socket, Command::Stop, &options);
+    let elapsed = started.elapsed();
+    let ack = ack.expect("stop delivered despite a flood of incomplete clients");
+
+    assert!(
+        matches!(ack.response, Response::Ok { .. }),
+        "stop must be acknowledged: {:?}",
+        ack.response
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a flood of incomplete clients delayed Stop for {elapsed:?}"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "the delayed Stop must reach the owner"
+    );
+    drop(flood);
+    drop(hogs);
+    server.shutdown();
+}
+
+#[test]
 fn an_oversized_frame_cannot_block_other_clients() {
     let dir = tempfile::tempdir().expect("temp dir");
     let socket = dir.path().join("control.sock");

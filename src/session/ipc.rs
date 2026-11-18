@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,17 +24,19 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A per-read inactivity timeout is not enough: a client that trickles a byte
 /// every few milliseconds could otherwise hold a worker indefinitely.
 const FRAME_DEADLINE: Duration = Duration::from_millis(750);
-/// A complete local control frame is only a few dozen bytes. When every worker
-/// is busy, the accept loop spends at most this long collecting such a frame
-/// before rejecting the connection.
+/// Frame budget for short-lived overflow workers used once every regular worker
+/// is busy. A stalled client is dropped after this long, but on its *own* thread
+/// — the accept loop never waits for a frame (review T2).
 const PRIORITY_WAIT: Duration = Duration::from_millis(20);
 /// Maximum bytes in one newline-delimited control frame. A client that sends
 /// more (without a newline) is dropped rather than allowed to grow memory.
 const MAX_FRAME_BYTES: usize = 4096;
-/// Upper bound on concurrently served clients. A slow client cannot hold up new
-/// connections: excess connections are served inline (complete frames) or
-/// rejected immediately (partial frames).
+/// Upper bound on long-lived workers serving frames with the full deadline.
 const MAX_WORKERS: usize = 8;
+/// Upper bound on short-lived overflow workers. Once both pools are full, new
+/// connections are rejected immediately without reading a frame, so a flood of
+/// slow clients cannot grow threads without bound or stall the accept loop.
+const OVERFLOW_WORKERS: usize = 128;
 
 /// Retry policy for a control client.
 ///
@@ -161,38 +163,39 @@ fn serve(
         return;
     }
 
+    // Live worker counts. Framing (which can block on a slow client) always
+    // happens on a worker thread; the accept loop only accepts, picks a bounded
+    // pool, and spawns. A queue of stalled clients therefore cannot serialize
+    // into a hotkey delay (review T2).
+    let regular = Arc::new(AtomicUsize::new(0));
+    let overflow = Arc::new(AtomicUsize::new(0));
+
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
-                // Framing (which may block on a slow client) normally happens
-                // on a worker, never on the accept loop. Bound the worker count
-                // so a flood of connections cannot spawn unbounded threads.
-                let free_slot = match workers.lock() {
-                    Ok(mut active) => {
-                        active.retain(|handle| !handle.is_finished());
-                        active.len() < MAX_WORKERS
-                    }
-                    Err(err) => {
-                        err.into_inner().retain(|handle| !handle.is_finished());
-                        false
-                    }
-                };
-                if !free_slot {
-                    // Never wait for a busy worker to free up: a trickling
-                    // client could hold every slot far past any read timeout,
-                    // delaying the real Stop command. Serve a complete local
-                    // command right here and reject an incomplete one quickly.
-                    handle_priority_connection(stream, &state, &control);
+                let (pool, budget) = if regular.load(Ordering::Acquire) < MAX_WORKERS {
+                    (&regular, FRAME_DEADLINE)
+                } else if overflow.load(Ordering::Acquire) < OVERFLOW_WORKERS {
+                    // At capacity, frame this connection on a short-lived
+                    // overflow worker rather than on the only accept thread.
+                    (&overflow, PRIORITY_WAIT)
+                } else {
+                    // Bounded admission: reject without reading a frame at all.
+                    tracing::debug!("control connection rejected: server saturated");
+                    drop(stream);
                     continue;
-                }
+                };
+                let slot = Arc::clone(pool);
+                slot.fetch_add(1, Ordering::AcqRel);
                 let worker_state = Arc::clone(&state);
                 let worker_control = control.clone();
                 let handle = thread::spawn(move || {
-                    handle_connection(stream, &worker_state, &worker_control);
+                    handle_connection(stream, &worker_state, &worker_control, budget);
+                    slot.fetch_sub(1, Ordering::AcqRel);
                 });
-                // The worker is already running; the tracking list only lets
-                // `shutdown` join it. Recover from a poisoned mutex rather than
-                // dropping the handle on the floor.
+                // The handle is kept only so `shutdown` can join it; the live
+                // count above decides admission. Recover from a poisoned mutex
+                // rather than dropping the handle on the floor.
                 match workers.lock() {
                     Ok(mut active) => active.push(handle),
                     Err(err) => err.into_inner().push(handle),
@@ -207,50 +210,21 @@ fn serve(
     }
 }
 
-/// Serve a frame when all workers are occupied. Legitimate local clients write
-/// their whole frame in one go, so this is fast; an incomplete frame is dropped
-/// instead of monopolising a slot or the accept loop.
-fn handle_priority_connection(
-    mut stream: UnixStream,
-    state: &Arc<Mutex<SessionState>>,
-    control: &SessionControl,
-) {
-    let deadline = Instant::now() + PRIORITY_WAIT;
-    let mut line = Vec::new();
-    let mut buf = [0u8; 512];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        let _ = stream.set_read_timeout(Some(remaining));
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                line.extend_from_slice(&buf[..n]);
-                if line.len() > MAX_FRAME_BYTES || line.contains(&b'\n') {
-                    break;
-                }
-            }
-            Err(_) => return,
-        }
-    }
-    if !line.contains(&b'\n') || line.len() > MAX_FRAME_BYTES {
-        tracing::warn!("incomplete control frame rejected while workers are busy");
-        return;
-    }
-    write_response(&mut stream, dispatch_frame(&line, state, control));
-}
-
+/// Read one frame and apply it, with a deadline measured from connection time.
+///
+/// `budget` is the full [`FRAME_DEADLINE`] for a regular worker and the much
+/// shorter [`PRIORITY_WAIT`] for an overflow worker. Either way the framing runs
+/// on a worker, never on the accept loop.
 fn handle_connection(
     mut stream: UnixStream,
     state: &Arc<Mutex<SessionState>>,
     control: &SessionControl,
+    budget: Duration,
 ) {
     // An absolute deadline, refreshed only as a remaining budget for each read,
     // bounds a client even when it keeps trickling bytes that reset a plain
     // inactivity timeout.
-    let deadline = Instant::now() + FRAME_DEADLINE;
+    let deadline = Instant::now() + budget;
     let mut line = Vec::new();
     let mut buf = [0u8; 512];
     loop {
@@ -285,8 +259,7 @@ fn handle_connection(
 }
 
 /// Decode one complete frame and apply it to the shared session state. Shared
-/// by worker connections and the at-capacity priority path so both behave
-/// identically.
+/// by regular and overflow workers so both behave identically.
 fn dispatch_frame(
     line: &[u8],
     state: &Arc<Mutex<SessionState>>,
