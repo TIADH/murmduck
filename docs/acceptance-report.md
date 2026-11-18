@@ -15,13 +15,13 @@ supported target (Fedora KDE Plasma Wayland):
   `/tmp/opencode` (not system packages); the only audio device is a virtual
   PulseAudio sink which, per ADR-0001, does not drain in real time, so audible
   playback cannot be confirmed here.
-- No RPM/dnf tooling or fresh Fedora install is available.
+- No Fedora KDE Plasma desktop or fresh Fedora install is available here.
 
 Consequently the automated tests exercise the **public seams** with fakes: the
 injectable `SelectionSource`, a local fake TTS HTTP server, `AudioSink::Fake`
 and `SyncedFake`, injected `RuntimePaths`, and a captured `tracing` writer.
-They verify logic, lifecycle, cleanup and privacy — not desktop behaviour,
-audible output or packaging on the target.
+They verify logic, lifecycle, cleanup and privacy — not desktop behaviour or
+audible output on the target.
 
 Commands used (all green):
 
@@ -67,13 +67,12 @@ Fedora KDE Plasma Wayland installation:
 | Criterion | What must be checked on target | Why it cannot be checked here | Status |
 | --- | --- | --- | --- |
 | Operates on Fedora KDE Plasma Wayland (§14) | Install and run on Fedora KDE Plasma Wayland; perform every check in this section and §5. | Host is headless Ubuntu; no Fedora, no KDE, no Wayland. | NOT verified |
-| Fresh Fedora KDE install can run the documented setup (§14) | Follow `docs/installation.md` end-to-end on a clean Fedora KDE system. | No fresh Fedora install or RPM tooling here. | NOT verified |
+| Fresh Fedora KDE install can run the documented setup (§14) | Follow `docs/installation.md` end-to-end on a clean Fedora KDE system. | No fresh Fedora install here. | NOT verified |
 | KDE Custom Shortcut start/stop | Configure the Global Shortcut as documented; select text, press shortcut → reading starts; press again → stops. | No KDE Plasma, no global shortcut daemon, no Wayland. | NOT verified |
 | Playback with no open terminal | Launch only via the KDE shortcut; confirm no terminal window appears and audio plays. | No desktop session; binary-level "process exits" is verified, but not KDE's launch environment. | NOT verified |
 | Focus preservation | Select text in Chromium/Zed/OpenCode Desktop/Alacritty/Konsole/Discord, press shortcut, confirm the same app keeps keyboard focus. No window should be raised. | No Wayland compositor or applications. The implementation never activates a window or changes the regular clipboard, but that is a code-level argument, not a runtime proof. | NOT verified |
 | Verified application matrix (§2) | Repeat the full workflow for all six applications listed in the spec. | No `wl-paste`, no Wayland, none of those apps. Their PRIMARY selection compatibility was already manually verified upstream, but the complete Murmduck workflow was not. | NOT verified |
 | Audible playback | `murmduck test-voice` must produce intelligible audio through PipeWire; MP3 decoder and sink plugins must load. | Headless VM; virtual PulseAudio sink does not drain in real time (ADR-0001). All audio tests use `fakesink`. | NOT verified |
-| Real RPM install on a fresh system | Build the tarball, build the RPM, `dnf install`, then run the documented setup using only the installed files. | No dnf/rpmbuild/fresh Fedora system. The spec file and helper are delivered but unexecuted here. | NOT verified |
 | API key from the graphical session | Set `~/.config/environment.d/murmduck.conf`, re-login, and confirm authenticated TTS works from the shortcut. | No graphical user session to inherit the variable. | NOT verified |
 | Executable discoverable by the graphical session | Confirm the absolute path in the KDE action works; or that a custom `PATH` from `environment.d` is inherited. | No KDE launch environment. | NOT verified |
 
@@ -90,18 +89,18 @@ Fedora KDE Plasma Wayland installation:
 - Fake TTS servers model HTTP 200 MP3 streams, stalls and connection refusal.
   They do not model real TTS providers, TLS, HTTP/2, or chunk framing quirks
   beyond what the GStreamer spike already covered.
-- The RPM spec has not been built with `rpmbuild` on Fedora here. The helper
-  script requires network access to crates.io when generating the vendor tree;
-  the resulting build is offline.
 
 ## 5. Target verification checklist (for a Fedora KDE machine)
 
-1. `sudo dnf install ./murmduck-0.1.0-1.*.x86_64.rpm`; check `murmduck --version`.
+1. Follow `docs/installation.md` to install the native build dependencies and
+   Rust toolchain, run `cargo install --path . --locked`, then check
+   `~/.cargo/bin/murmduck --version`.
 2. Create `~/.config/murmduck/config.toml` from `docs/installation.md`; set up
    the API key in `~/.config/environment.d/` if the server needs one, then
    re-login.
 3. `murmduck test-voice` — confirm intelligible audio (audible criterion).
-4. Configure the KDE Custom Shortcut to `/usr/bin/murmduck toggle`.
+4. Configure the KDE Custom Shortcut to `~/.cargo/bin/murmduck toggle` (use the
+   absolute path, e.g. `/home/your-user/.cargo/bin/murmduck toggle`).
 5. For each app in spec §2: highlight a sentence (include Vietnamese/Unicode),
    press the shortcut, confirm audio and unchanged focus; press again to stop.
 6. Hammer the shortcut rapidly; confirm only one stream is audible at a time.

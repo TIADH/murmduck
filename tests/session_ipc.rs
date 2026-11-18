@@ -1,9 +1,11 @@
 //! IPC transport seam: a real Unix control socket in a temp dir, with the
 //! owner's control server on one side and the control client on the other.
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use murmduck::session::SessionState;
 use murmduck::session::body::Cancellation;
@@ -159,6 +161,83 @@ fn a_client_gives_up_within_a_bounded_time_when_nobody_listens() {
 
     let err = ipc::send_command(&socket, Command::Stop, &options).expect_err("no listener");
     assert!(matches!(err, ipc::ClientError::Unavailable), "{err:?}");
+}
+
+#[test]
+fn a_client_that_never_completes_a_frame_does_not_delay_a_stop_command() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+    let cancel = Cancellation::new();
+    let mut server = ControlServer::spawn(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        cancel.clone(),
+    );
+
+    // Connect and send a partial JSON frame with no terminating newline. Give
+    // the accept loop time to start waiting on this client before sending Stop.
+    let mut stalled = UnixStream::connect(&socket).expect("connect stalled client");
+    stalled
+        .write_all(b"{\"version\":1,\"command\":\"S")
+        .expect("send partial frame");
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let ack = ipc::send_command(&socket, Command::Stop, &fast_options()).expect("stop delivered");
+    assert!(
+        matches!(ack.response, Response::Ok { .. }),
+        "stop must still be acknowledged: {:?}",
+        ack.response
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_200),
+        "a stalled client blocked a hotkey command for {:?}",
+        started.elapsed()
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "the delayed Stop must reach the owner"
+    );
+    drop(stalled);
+    server.shutdown();
+}
+
+#[test]
+fn an_oversized_frame_cannot_block_other_clients() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+    let mut server = ControlServer::spawn(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        Cancellation::new(),
+    );
+
+    let mut huge = UnixStream::connect(&socket).expect("connect oversized client");
+    // Well beyond any reasonable control frame, with no newline so the reader
+    // cannot simply stop at a delimiter.
+    huge.write_all(&vec![b'x'; 64 * 1024])
+        .expect("send oversized frame");
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let ack =
+        ipc::send_command(&socket, Command::Status, &fast_options()).expect("status delivered");
+    assert!(
+        matches!(ack.response, Response::Ok { .. }),
+        "a runaway client must not block status: {:?}",
+        ack.response
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_200),
+        "an oversized frame delayed status for {:?}",
+        started.elapsed()
+    );
+    drop(huge);
+    server.shutdown();
 }
 
 #[test]

@@ -3,8 +3,8 @@
 //! Every criterion that can be checked on this headless host is exercised here
 //! through public seams with fakes: an injectable selection source, a local
 //! fake TTS server, `AudioSink::Fake`/`SyncedFake`, injected runtime paths and
-//! a captured tracing writer. No Wayland session, `wl-paste`, RPM install or
-//! audible device is needed. Criteria that need the Fedora KDE Wayland target
+//! a captured tracing writer. No Wayland session, `wl-paste` or audible device
+//! is needed. Criteria that need the Fedora KDE Wayland target
 //! are recorded in `docs/acceptance-report.md` instead of being faked here.
 
 use std::io::{Read, Write};

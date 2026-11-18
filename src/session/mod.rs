@@ -37,6 +37,8 @@ pub enum SessionError {
     Protocol(protocol::ProtocolError),
     /// A control client could not reach the owner.
     Client(ipc::ClientError),
+    /// The owner refused a control command (`Response::Error`).
+    Control { detail: String },
     /// The PRIMARY selection could not be read or validated.
     Selection(SelectionError),
     /// The TTS request failed (network, HTTP status or stream error).
@@ -55,6 +57,7 @@ impl fmt::Display for SessionError {
             Self::Io { detail } => write!(f, "session I/O error: {detail}"),
             Self::Protocol(err) => write!(f, "{err}"),
             Self::Client(err) => write!(f, "{err}"),
+            Self::Control { detail } => write!(f, "control command failed: {detail}"),
             Self::Selection(err) => write!(f, "{err}"),
             Self::Tts(err) => write!(f, "{err}"),
             Self::Audio(err) => write!(f, "{err}"),

@@ -27,6 +27,10 @@ pub enum SelectionError {
     Empty,
     /// The selection exceeded the configured character limit.
     TooLong { max: usize, actual: usize },
+    /// The provider produced more bytes than the read cap allows. Detected
+    /// *during* the read so a runaway provider cannot grow memory without
+    /// bound; the child is terminated and reaped before this is returned.
+    OutputTooLarge { max_bytes: usize },
     /// The external provider process exited with a non-zero status.
     ProviderFailed { status: String, detail: String },
     /// The provider produced bytes that are not valid UTF-8.
@@ -50,6 +54,10 @@ impl fmt::Display for SelectionError {
             Self::TooLong { max, actual } => write!(
                 f,
                 "PRIMARY selection is too long: {actual} characters (limit is {max})"
+            ),
+            Self::OutputTooLarge { max_bytes } => write!(
+                f,
+                "selection provider output exceeded the {max_bytes}-byte read cap"
             ),
             Self::ProviderFailed { status, detail } => {
                 if detail.is_empty() {
@@ -209,6 +217,29 @@ pub fn success_report(selection: &Selection) -> String {
 /// but bounding them keeps errors readable.
 const STDERR_DETAIL_LIMIT: usize = 200;
 
+/// UTF-8 uses at most four bytes per character. The stdout cap is the worst
+/// case for one more character than the limit (so an oversized selection is
+/// still detected) plus a small allowance for control bytes.
+const BYTES_PER_CHAR: usize = 4;
+const LIMIT_DETECTION_ALLOWANCE: usize = 64;
+
+/// Byte cap used when a provider has no explicit configured limit. Matches the
+/// documented default `selection.max_chars` so production is bounded even if a
+/// caller builds a source without the configured limit.
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 20_000 * BYTES_PER_CHAR + LIMIT_DETECTION_ALLOWANCE;
+
+/// Result of a bounded pipe drain. `overflow` is reported as soon as it is
+/// detected (before EOF) so the owner can terminate a runaway child promptly.
+struct PipeRead {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+enum PipeResult {
+    Read(PipeRead),
+    Io(io::Error),
+}
+
 /// How often a cancellable read re-checks the signal while waiting on output.
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 
@@ -221,6 +252,9 @@ pub struct WaylandPrimary {
     program: String,
     args: Vec<String>,
     timeout: Duration,
+    /// Hard cap on stdout bytes read from the provider, derived from
+    /// `selection.max_chars` (UTF-8 worst case plus limit-detection room).
+    max_output_bytes: usize,
 }
 
 impl WaylandPrimary {
@@ -230,6 +264,7 @@ impl WaylandPrimary {
             program: "wl-paste".to_owned(),
             args: vec!["--primary".to_owned(), "--no-newline".to_owned()],
             timeout,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 
@@ -242,7 +277,19 @@ impl WaylandPrimary {
             program: program.into(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             timeout,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// Bound stdout reads from the configured character limit. One extra
+    /// four-byte character and a small allowance leave room to detect a
+    /// too-long selection rather than truncating a valid one.
+    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_output_bytes = max_chars
+            .saturating_add(1)
+            .saturating_mul(BYTES_PER_CHAR)
+            .saturating_add(LIMIT_DETECTION_ALLOWANCE);
+        self
     }
 
     fn spawn(&self) -> io::Result<Child> {
@@ -283,11 +330,12 @@ impl WaylandPrimary {
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
 
-        // Drain each pipe on its own thread so a child that fills one pipe
-        // cannot block while we wait on the other. The main thread can then
-        // enforce the timeout and kill the child if it overruns.
-        let stdout_rx = drain(stdout);
-        let stderr_rx = drain(stderr);
+        // Drain each pipe on its own bounded reader so a child that fills one
+        // pipe cannot block while we wait on the other, and so neither pipe can
+        // grow memory without limit. The main thread enforces the timeout and
+        // kills the child if it overruns or stdout exceeds its byte cap.
+        let stdout_rx = drain(stdout, self.max_output_bytes);
+        let stderr_rx = drain(stderr, STDERR_DETAIL_LIMIT * BYTES_PER_CHAR);
 
         // `checked_add` guards against an extreme configured timeout
         // overflowing `Instant`; in that case cap the wait at one day.
@@ -305,8 +353,16 @@ impl WaylandPrimary {
                 return Err(self.timeout_error());
             }
             match stdout_rx.recv_timeout(remaining.min(CANCEL_POLL)) {
-                Ok(Ok(bytes)) => break bytes,
-                Ok(Err(err)) => {
+                Ok(PipeResult::Read(PipeRead { bytes, overflow })) => {
+                    if overflow {
+                        kill_and_reap(&mut child);
+                        return Err(SelectionError::OutputTooLarge {
+                            max_bytes: self.max_output_bytes,
+                        });
+                    }
+                    break bytes;
+                }
+                Ok(PipeResult::Io(err)) => {
                     kill_and_reap(&mut child);
                     return Err(SelectionError::Io {
                         detail: err.to_string(),
@@ -346,11 +402,10 @@ impl WaylandPrimary {
             }
         };
 
-        let stderr_bytes = stderr_rx
-            .recv()
-            .ok()
-            .and_then(|result| result.ok())
-            .unwrap_or_default();
+        let stderr_bytes = match stderr_rx.recv() {
+            Ok(PipeResult::Read(read)) => read.bytes,
+            _ => Vec::new(), // diagnostic truncation is not fatal
+        };
 
         if !status.success() {
             let detail = String::from_utf8_lossy(&stderr_bytes)
@@ -368,13 +423,47 @@ impl WaylandPrimary {
     }
 }
 
-/// Read a pipe to EOF on a background thread and deliver the bytes by channel.
-fn drain<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+/// Read a pipe on a background thread, keeping at most `max_bytes` and
+/// reporting overflow *before* EOF so the owner can terminate a runaway child.
+/// The reader is still drained to EOF afterwards so the child never blocks on
+/// a full pipe while the owner tears it down.
+fn drain<R: Read + Send + 'static>(mut reader: R, max_bytes: usize) -> mpsc::Receiver<PipeResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
-        let _ = tx.send(result);
+        let mut scratch = [0u8; 8 * 1024];
+        let mut overflow_reported = false;
+        loop {
+            match reader.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if overflow_reported {
+                        continue; // keep draining, but stop storing bytes
+                    }
+                    if bytes.len() + n > max_bytes {
+                        let keep = max_bytes.saturating_sub(bytes.len());
+                        bytes.extend_from_slice(&scratch[..keep]);
+                        let _ = tx.send(PipeResult::Read(PipeRead {
+                            bytes: bytes.clone(),
+                            overflow: true,
+                        }));
+                        overflow_reported = true;
+                    } else {
+                        bytes.extend_from_slice(&scratch[..n]);
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(PipeResult::Io(err));
+                    return;
+                }
+            }
+        }
+        if !overflow_reported {
+            let _ = tx.send(PipeResult::Read(PipeRead {
+                bytes,
+                overflow: false,
+            }));
+        }
     });
     rx
 }

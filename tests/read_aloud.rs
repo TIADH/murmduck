@@ -76,6 +76,9 @@ struct ServerConfig {
     /// When set, the server sends `chunks[0]`, waits on this receiver, then
     /// sends the rest — letting a test observe playback before the full body.
     release: Option<mpsc::Receiver<()>>,
+    /// Optional pause between chunks; models slow HTTP delivery without a real
+    /// network so time-to-first-audio can be measured deterministically.
+    chunk_delay: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -84,6 +87,18 @@ impl ServerConfig {
             status: 200,
             chunks,
             release: None,
+            chunk_delay: None,
+        }
+    }
+
+    /// A successful stream whose first chunk is deliberately tiny and followed
+    /// by a short pause, so a decoder needs the second chunk to decode a frame.
+    fn slow_start(chunks: Vec<Vec<u8>>, delay: Duration) -> Self {
+        Self {
+            status: 200,
+            chunks,
+            release: None,
+            chunk_delay: Some(delay),
         }
     }
 
@@ -92,6 +107,7 @@ impl ServerConfig {
             status,
             chunks: Vec::new(),
             release: None,
+            chunk_delay: None,
         }
     }
 }
@@ -248,6 +264,11 @@ fn serve_one(
             // Bounded so a failing assertion cannot hang the test thread.
             let _ = release.recv_timeout(Duration::from_secs(20));
         }
+        if let Some(delay) = config.chunk_delay {
+            // The first chunk is intentionally too short to decode; the pause
+            // guarantees the next chunk arrives after `write()` has returned.
+            thread::sleep(delay);
+        }
         let _ = write!(stream, "{:X}\r\n", chunk.len());
         let _ = stream.write_all(chunk);
         let _ = stream.write_all(b"\r\n");
@@ -372,6 +393,7 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
         release: Some(gate),
+        chunk_delay: None,
     });
     let report = Arc::new(Mutex::new(SessionReport::default()));
     let mut body = body_for(
@@ -403,6 +425,54 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
 }
 
 #[test]
+fn a_short_first_http_chunk_does_not_stall_first_audio_by_a_second() {
+    // The first MP3 frame is split across early HTTP chunks: the first chunk is
+    // too short to decode and the next one arrives shortly afterwards. A write
+    // path that blocks waiting for the decoded-buffer probe cannot deliver the
+    // second chunk, so `Playing` is published a full second late.
+    let bytes = fixture();
+    let server = FakeTtsServer::spawn(ServerConfig::slow_start(
+        vec![bytes[..8].to_vec(), bytes[8..].to_vec()],
+        Duration::from_millis(50),
+    ));
+    let report = Arc::new(Mutex::new(SessionReport::default()));
+    let mut body = body_for(
+        &server,
+        FakeSource::new("split first frame"),
+        None,
+        Arc::clone(&report),
+    );
+    let state = Arc::new(Mutex::new(SessionState::Starting));
+    let ctx = SessionContext {
+        cancel: Cancellation::new(),
+        state: Arc::clone(&state),
+    };
+
+    let started = Instant::now();
+    let owner = thread::spawn(move || body.run(&ctx));
+    assert!(
+        wait_until(
+            || *state.lock().expect("state lock") == SessionState::Playing,
+            Duration::from_secs(5)
+        ),
+        "playback never reached Playing"
+    );
+    let ttfa = started.elapsed();
+    assert!(
+        ttfa < Duration::from_millis(700),
+        "first audio stalled for {ttfa:?}; a write blocked on the Started probe \
+         cannot feed the next chunk and waits the whole 1 s deadline"
+    );
+
+    owner.join().expect("body joins").expect("body succeeds");
+    assert!(
+        report.lock().expect("report lock").decoded_bytes > 0,
+        "the split frame still decoded to audio"
+    );
+    server.join();
+}
+
+#[test]
 fn the_control_socket_reports_buffering_while_the_server_is_slow() {
     let bytes = fixture();
     let midpoint = bytes.len() / 2;
@@ -411,6 +481,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
         release: Some(gate),
+        chunk_delay: None,
     });
     let dir = tempfile::tempdir().expect("temp dir");
     let runtime = paths(&dir);

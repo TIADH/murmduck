@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::audio::{AudioError, AudioSink, StreamConfig, StreamingMp3Player};
 use crate::config::{SelectionConfig, TtsConfig};
@@ -287,6 +287,8 @@ impl<T: TeardownTarget> OrderedTeardown<T> {
 /// so a `push()` blocked on GStreamer back-pressure unblocks immediately.
 struct PipelineWatchdog {
     done: Arc<AtomicBool>,
+    /// The watched signal, kept so `disarm` can wake a sleeping watchdog.
+    wake: Cancellation,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -294,23 +296,25 @@ impl PipelineWatchdog {
     fn spawn(teardown: OrderedTeardown<PipelineTeardownTarget>, cancel: Cancellation) -> Self {
         let done = Arc::new(AtomicBool::new(false));
         let guard_done = Arc::clone(&done);
+        let wake_for_thread = cancel.clone();
         let thread = thread::spawn(move || {
-            while !guard_done.load(Ordering::Acquire) {
-                if cancel.is_cancelled() {
-                    teardown.perform();
-                    return;
-                }
-                thread::sleep(Duration::from_millis(2));
+            // Event-driven: block until cancellation or disarm instead of
+            // waking every 2 ms for the whole duration of a reading.
+            wake_for_thread.wait_until(|| guard_done.load(Ordering::Acquire));
+            if wake_for_thread.is_cancelled() && !guard_done.load(Ordering::Acquire) {
+                teardown.perform();
             }
         });
         Self {
             done,
+            wake: cancel,
             thread: Some(thread),
         }
     }
 
     fn disarm(&mut self) {
         self.done.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -334,9 +338,6 @@ struct AudioSinkWriter<'a> {
     /// Cleared by teardown step 1 before the HTTP request is cancelled, so no
     /// chunk accepted after cancellation can reach the pipeline.
     accepting: Arc<AtomicBool>,
-    playing: bool,
-    /// Bounded window in which to await the asynchronous `Started` probe.
-    start_deadline: Option<Instant>,
     cancelled: bool,
     audio_error: Option<AudioError>,
 }
@@ -353,31 +354,11 @@ impl Write for AudioSinkWriter<'_> {
             self.audio_error = Some(err);
             return Err(io::Error::other("audio pipeline rejected a chunk"));
         }
-        if !self.playing {
-            // The decoded-buffer probe runs on GStreamer's streaming thread,
-            // so `Started` may be recorded just after `push` returns. Wait
-            // briefly (once, not per chunk) before declaring playback under way.
-            let deadline = *self
-                .start_deadline
-                .get_or_insert_with(|| Instant::now() + Duration::from_millis(1_000));
-            while Instant::now() < deadline
-                && self.accepting.load(Ordering::Acquire)
-                && !self.observer.ctx.cancel.is_cancelled()
-                && !self.player.has_started()
-            {
-                thread::sleep(Duration::from_millis(2));
-            }
-            if !self.accepting.load(Ordering::Acquire) || self.observer.ctx.cancel.is_cancelled() {
-                self.cancelled = true;
-                // See the note in `write`: an Interrupted error would be retried
-                // by `write_all` for as long as cancellation remains set.
-                return Err(io::Error::other("session cancelled"));
-            }
-            if self.player.has_started() {
-                self.playing = true;
-                self.observer.publish(SessionState::Playing);
-            }
-        }
+        // Never wait for `Started` here: this method runs inside the HTTP read
+        // loop, and blocking would prevent the very next chunk from being
+        // delivered (the chunk that often completes the first MP3 frame). The
+        // decoded-buffer probe publishes `Playing` asynchronously via the
+        // callback registered by the session body.
         Ok(buf.len())
     }
 
@@ -503,6 +484,29 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
         );
         observer.player_opened();
 
+        // Publish `Playing` from the decoded-buffer probe on GStreamer's
+        // streaming thread. The HTTP write path must stay nonblocking so it can
+        // keep delivering chunks while the first MP3 frame is reassembled.
+        let playing = Arc::new(AtomicBool::new(false));
+        {
+            let state = Arc::clone(&ctx.state);
+            let report = self.report.clone();
+            let playing_flag = Arc::clone(&playing);
+            player.on_started(move || {
+                if playing_flag.swap(true, Ordering::AcqRel) {
+                    return; // already published
+                }
+                if let Ok(mut guard) = state.lock() {
+                    *guard = SessionState::Playing;
+                }
+                if let Some(report) = &report
+                    && let Ok(mut guard) = report.lock()
+                {
+                    guard.states.push(SessionState::Playing);
+                }
+            });
+        }
+
         let accepting = Arc::new(AtomicBool::new(true));
         let http_cancel = Cancellation::new();
         let teardown = OrderedTeardown::new(
@@ -553,8 +557,6 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
             player: &player,
             observer,
             accepting: Arc::clone(&accepting),
-            playing: false,
-            start_deadline: None,
             cancelled: false,
             audio_error: None,
         };
@@ -588,11 +590,6 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
             return Err(SessionError::Tts(err));
         }
 
-        // A very short stream can finish before the probe marks Started.
-        if !writer.playing {
-            observer.publish(SessionState::Playing);
-        }
-
         let stats = match player.finish() {
             Ok(stats) => stats,
             Err(AudioError::Cancelled) => {
@@ -608,6 +605,19 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
                 return Err(SessionError::Audio(err));
             }
         };
+        // A successful 2xx response with no decodable MP3 must not be reported
+        // as a completed reading (review R4). The probe callback already
+        // published `Playing` for real audio; a callback that raced with the
+        // end of the stream is covered here, but only when audio was decoded.
+        if stats.decoded_bytes == 0 {
+            watchdog.disarm();
+            observer.stop_pipeline(&player);
+            observer.publish(SessionState::Stopping);
+            return Err(SessionError::Audio(AudioError::NoDecodedAudio));
+        }
+        if !playing.load(Ordering::Acquire) && player.has_started() {
+            observer.publish(SessionState::Playing);
+        }
         if let Some(report) = &self.report
             && let Ok(mut guard) = report.lock()
         {

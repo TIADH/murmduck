@@ -27,6 +27,7 @@ Audio backend decision: [`docs/adr/0001-gstreamer-streaming-audio-backend.md`](d
 ## Requirements
 
 - Fedora KDE Plasma Wayland (x86_64).
+- A Rust toolchain (Rust and Cargo) to install from source.
 - `wl-clipboard` (`wl-paste`) for the PRIMARY selection.
 - GStreamer with an MP3 decoder (`mpg123audiodec`) and an audio sink plugin.
 - A reachable OpenAI-compatible streaming TTS server that returns `audio/mpeg`
@@ -34,25 +35,38 @@ Audio backend decision: [`docs/adr/0001-gstreamer-streaming-audio-backend.md`](d
 
 ## Install
 
-### From RPM
+Install from a checkout of this repository. Full details, including the
+Rust toolchain and Fedora build dependencies, are in
+[`docs/installation.md`](docs/installation.md).
 
-Build the package as described in [`docs/installation.md`](docs/installation.md#install-from-rpm),
-then:
+### Native build dependencies
+
+On Fedora, install only the native libraries GStreamer's Rust bindings need at
+build time:
 
 ```bash
-sudo dnf install ./murmduck-0.1.0-1.*.x86_64.rpm
+sudo dnf install gstreamer1-devel gstreamer1-plugins-base-devel pkgconf-pkg-config
 ```
 
-The RPM installs `/usr/bin/murmduck` and documentation under
-`/usr/share/doc/murmduck/`.
+### Rust toolchain
+
+Install Rust and Cargo as a separate step, for example with
+[rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"   # or start a new shell
+```
 
 ### From source
 
 ```bash
-sudo dnf install rust cargo gstreamer1-devel gstreamer1-plugins-base-devel pkgconf-pkg-config
-cargo build --release --locked
-install -Dm755 target/release/murmduck ~/.local/bin/murmduck
+cargo install --path . --locked
 ```
+
+Cargo installs the binary to `$CARGO_HOME/bin` (normally `~/.cargo/bin/murmduck`).
+Add that directory to the graphical session's `PATH`, or use the absolute path
+in the KDE shortcut (see below).
 
 ## Configure
 
@@ -96,8 +110,8 @@ In KDE System Settings → **Shortcuts → Custom Shortcuts**:
 1. **Edit → New → Global Shortcut → Command or URL**.
 2. Name it, e.g. *Murmduck: read / stop selection*.
 3. Set the trigger to your preferred combination (for example `Ctrl+Alt+R`).
-4. Set **Command URL** to the absolute path
-   `/usr/bin/murmduck toggle` (or the absolute path to your source install).
+4. Set **Command URL** to the absolute path of the installed binary, for
+   example `/home/your-user/.cargo/bin/murmduck toggle` (`$CARGO_HOME/bin/murmduck`).
 5. Apply, then select text in a supported application and press the shortcut.
    Press it again to stop playback.
 

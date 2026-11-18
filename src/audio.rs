@@ -22,6 +22,9 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
 
+/// Callback invoked once when the first decoded buffer reaches the sink.
+type StartedCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Where decoded audio is delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioSink {
@@ -107,6 +110,8 @@ pub enum AudioError {
     Timeout,
     /// Playback was cancelled while a chunk was being fed.
     Cancelled,
+    /// The response stream produced bytes but no decodable audio samples.
+    NoDecodedAudio,
 }
 
 impl fmt::Display for AudioError {
@@ -117,6 +122,7 @@ impl fmt::Display for AudioError {
             Self::Decode(message) => write!(f, "audio decode error: {message}"),
             Self::Timeout => write!(f, "timed out waiting for playback to finish"),
             Self::Cancelled => write!(f, "playback was cancelled"),
+            Self::NoDecodedAudio => write!(f, "TTS response contained no decodable audio"),
         }
     }
 }
@@ -144,6 +150,9 @@ pub struct StreamingMp3Player {
     bus: gst::Bus,
     inner: Arc<Mutex<Inner>>,
     cancelled: Arc<AtomicBool>,
+    /// Invoked once from the GStreamer streaming thread when the first decoded
+    /// buffer reaches the sink (see [`Self::on_started`]).
+    started_callback: Arc<Mutex<Option<StartedCallback>>>,
 }
 
 impl StreamingMp3Player {
@@ -159,6 +168,7 @@ impl StreamingMp3Player {
 
         let inner = Arc::new(Mutex::new(Inner::default()));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let started_callback: Arc<Mutex<Option<StartedCallback>>> = Arc::new(Mutex::new(None));
 
         let underrun_inner = Arc::clone(&inner);
         let underrun_cancelled = Arc::clone(&cancelled);
@@ -249,6 +259,7 @@ impl StreamingMp3Player {
         // A pad probe on the sink's input observes decoded audio for every sink
         // type (including real devices), so tests need no special sink.
         let probe_inner = Arc::clone(&inner);
+        let probe_callback = Arc::clone(&started_callback);
         let capture = config.capture_decoded;
         sink_element
             .static_pad("sink")
@@ -258,14 +269,31 @@ impl StreamingMp3Player {
                     return gst::PadProbeReturn::Ok;
                 };
                 let map = buffer.map_readable().expect("map decoded buffer");
-                let mut state = probe_inner.lock().expect("lock probe state");
-                state.stats.decoded_bytes += map.as_slice().len() as u64;
-                if !state.started {
-                    state.started = true;
-                    state.events.push(PlayerEvent::Started);
-                }
-                if capture {
-                    state.captured.extend_from_slice(map.as_slice());
+                // Update the shared state and decide whether this is the first
+                // decoded buffer while holding the lock, then release it before
+                // invoking the callback (which may call back into the player).
+                let callback = {
+                    let mut state = probe_inner.lock().expect("lock probe state");
+                    state.stats.decoded_bytes += map.as_slice().len() as u64;
+                    let first = !state.started;
+                    if first {
+                        state.started = true;
+                        state.events.push(PlayerEvent::Started);
+                    }
+                    if capture {
+                        state.captured.extend_from_slice(map.as_slice());
+                    }
+                    if first {
+                        probe_callback
+                            .lock()
+                            .expect("lock started callback")
+                            .clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(callback) = callback {
+                    callback();
                 }
                 gst::PadProbeReturn::Ok
             });
@@ -279,7 +307,18 @@ impl StreamingMp3Player {
             bus,
             inner,
             cancelled,
+            started_callback,
         })
+    }
+
+    /// Register a callback invoked once, on GStreamer's streaming thread, when
+    /// the first decoded buffer reaches the sink. Register before [`Self::start`]
+    /// so no startup event can be missed; the callback must not block.
+    pub fn on_started<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.started_callback.lock().expect("lock started callback") = Some(Arc::new(callback));
     }
 
     /// Move the pipeline to PLAYING. Call before the first [`Self::push`].

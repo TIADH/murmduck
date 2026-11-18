@@ -38,6 +38,12 @@ pub enum TtsError {
     Http { status: u16 },
     /// The response body could not be read or forwarded to the sink.
     Stream { detail: String },
+    /// A successful status carried no audio bytes at all (e.g. 204 or an empty
+    /// 200). Previously this was reported as a completed reading.
+    EmptyResponse,
+    /// The server's `Content-Type` clearly did not describe audio. A missing
+    /// header or `application/octet-stream` is accepted where practical.
+    UnexpectedContentType { value: String },
     /// The request was aborted because the session was cancelled.
     Cancelled,
 }
@@ -48,6 +54,11 @@ impl fmt::Display for TtsError {
             Self::Request { detail } => write!(f, "TTS request failed: {detail}"),
             Self::Http { status } => write!(f, "TTS server returned HTTP {status}"),
             Self::Stream { detail } => write!(f, "TTS response stream failed: {detail}"),
+            Self::EmptyResponse => write!(f, "TTS server returned an empty audio response"),
+            Self::UnexpectedContentType { value } => write!(
+                f,
+                "TTS server returned unexpected content type {value:?}; expected audio/mpeg"
+            ),
             Self::Cancelled => write!(f, "TTS request cancelled"),
         }
     }
@@ -149,10 +160,29 @@ impl TtsClient {
             };
 
             let status = response.status();
-            if status.is_client_error() || status.is_server_error() {
+            if !status.is_success() {
                 return Err(TtsError::Http {
                     status: status.as_u16(),
                 });
+            }
+            // Validate the declared content type where practical: accept audio
+            // types and generic binary streams, but reject clearly textual or
+            // JSON responses that a 2xx status alone would let through.
+            if let Some(value) = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or(value)
+                        .trim()
+                        .to_ascii_lowercase()
+                })
+                && !(value.starts_with("audio/") || value == "application/octet-stream")
+            {
+                return Err(TtsError::UnexpectedContentType { value });
             }
             if cancel.is_cancelled() {
                 return Err(TtsError::Cancelled);
@@ -181,6 +211,9 @@ impl TtsClient {
                     });
                 }
                 total += chunk.len() as u64;
+            }
+            if total == 0 {
+                return Err(TtsError::EmptyResponse);
             }
             Ok(total)
         })

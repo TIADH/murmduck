@@ -64,7 +64,8 @@ fn reading_factory(
         ReadingKind::Selection => AppBody::Selection(make_body(
             &config,
             api_key.clone(),
-            WaylandPrimary::new(config.selection.timeout()),
+            WaylandPrimary::new(config.selection.timeout())
+                .with_max_chars(config.selection.max_chars),
         )),
         ReadingKind::TestVoice => AppBody::TestVoice(make_body(
             &config,
@@ -90,11 +91,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // network or audio work begins.
     let path = config::config_path()?;
     let config = config::Config::load(&path)?;
-    let api_key = config.tts.resolve_api_key()?;
     let level = config.logging.level_filter()?;
 
     logging::init(level)?;
     tracing::debug!(path = %path.display(), "configuration loaded");
+
+    // Credentials are only resolved by an invocation that will START a reading.
+    // `stop` and `status` talk to an existing owner and never contact TTS, so a
+    // missing `api_key_env` variable must not prevent them from working.
+    let api_key = if routing::starts_session(cli.command) {
+        config.tts.resolve_api_key()?
+    } else {
+        None
+    };
     logging::log_startup(&config, env!("CARGO_PKG_VERSION"), api_key.as_deref());
 
     dispatch(&config, cli.command, api_key)

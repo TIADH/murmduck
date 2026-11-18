@@ -191,6 +191,77 @@ fn stop_and_status_are_noops_when_no_session_is_active() {
 }
 
 #[test]
+fn stop_and_status_do_not_require_the_api_key_to_be_set() {
+    // `stop` and `status` never contact the TTS server. A configured
+    // `api_key_env` whose variable is absent must not prevent them from
+    // reaching an existing owner (or reporting an idle session).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = dir.path().join("murmduck");
+    std::fs::create_dir(&config_dir).expect("create config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[tts]\napi_key_env = \"MURMDUCK_TEST_DEFINITELY_UNSET_KEY_9F3A\"\n",
+    )
+    .expect("write config");
+    let timeout = std::time::Duration::from_secs(3);
+
+    for args in [&["stop"][..], &["status"][..], &["status", "--json"][..]] {
+        let output = run_isolated(args, dir.path(), timeout);
+        assert!(
+            output.status.success(),
+            "murmduck {args:?} should not need TTS credentials; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_declined_control_command_makes_the_cli_exit_with_failure() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use murmduck::session::lock::InstanceLock;
+    use murmduck::session::paths::RuntimePaths;
+    use murmduck::session::protocol::{self, Response};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paths = RuntimePaths::new(dir.path().join("runtime").join("murmduck"));
+    let guard = InstanceLock::try_acquire(&paths.lock)
+        .expect("acquire lock")
+        .expect("become fake owner");
+    let listener = UnixListener::bind(&paths.socket).expect("bind control socket");
+
+    // Stand in for an owner that refuses the command (e.g. a replacement
+    // declined during shutdown). The wire protocol is unchanged; only the CLI's
+    // exit status must now reflect the refusal.
+    let owner = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept command");
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let frame = protocol::encode_response(Response::Error {
+            message: "declined by test".to_owned(),
+        });
+        stream.write_all(frame.as_bytes()).expect("write refusal");
+        drop(stream);
+        drop(guard);
+    });
+
+    let output = run_isolated(&["stop"], dir.path(), std::time::Duration::from_secs(3));
+    owner.join().expect("fake owner joins");
+    assert!(
+        !output.status.success(),
+        "a refused control command must exit nonzero; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("declined by test"),
+        "the refusal must be reported: {stderr:?}"
+    );
+}
+
+#[test]
 fn toggle_exits_promptly_when_the_selection_provider_is_unavailable() {
     // An empty PATH guarantees the selection provider cannot start, so the
     // owner fails while reading the selection. It must report the error and

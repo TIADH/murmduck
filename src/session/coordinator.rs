@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use crate::cli::Command;
 
-use super::body::{Cancellation, NoopBody, SessionBody, SessionContext};
+use super::body::{NoopBody, SessionBody, SessionContext};
 use super::control::{ReadingKind, SessionControl};
 use super::ipc::{self, ClientError, ClientOptions, ControlServer};
 use super::lock::InstanceLock;
@@ -139,7 +139,7 @@ where
                 routing::wire_command(command),
                 &retry.connect,
             ) {
-                Ok(ack) => return Ok(outcome_from_ack(command, ack.response)),
+                Ok(ack) => return outcome_from_ack(command, ack.response),
                 Err(ClientError::Unavailable) => {
                     // The owner may have exited or not created its socket yet.
                     // Re-trying the lock lets us take over within a bounded time.
@@ -219,24 +219,20 @@ where
     let mut server =
         ControlServer::spawn_with_control(listener, Arc::clone(&state), control.clone());
 
-    let mut kind = initial_kind;
+    let mut next_kind = initial_kind;
     let mut first_error: Option<SessionError> = None;
     let mut last_body: Option<B> = None;
-    // A replacement accepted in the shutdown window; run it before closing.
-    let mut final_kind: Option<ReadingKind> = None;
     loop {
         if control.stop_requested() {
             break;
         }
 
-        // Consume a request that arrived before this reading started, so one
-        // arriving *during* it is seen on the next iteration.
-        control.clear_replace();
-        let attempt = Cancellation::new();
-        control.set_attempt_cancel(attempt.clone());
-        if control.stop_requested() {
-            attempt.cancel();
-        }
+        // Consume a pending replacement and install this attempt's cancellation
+        // in one operation. A command accepted right at this handoff cancels
+        // the *new* attempt (or is kept for the next loop) instead of being
+        // discarded by an unconditional `clear_replace`.
+        let (reading_kind, attempt) = control.begin_attempt(next_kind);
+        next_kind = reading_kind;
         {
             let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
             *guard = SessionState::Starting;
@@ -246,7 +242,6 @@ where
             cancel: attempt,
             state: Arc::clone(&state),
         };
-        let reading_kind = final_kind.take().unwrap_or(kind);
         let mut body = factory(reading_kind);
         let result = body.run(&context);
         let failed = result.is_err();
@@ -259,15 +254,15 @@ where
             break;
         }
         if control.replace_requested() {
-            kind = control.replacement_kind();
+            // `begin_attempt` on the next iteration takes the request; a second
+            // one accepted in this window simply overwrites it (last-wins).
             continue;
         }
         // §6: close the shutdown race atomically. A replacement that arrived
         // after the last check is returned and run; one arriving afterwards is
         // declined with an explicit acknowledgement by the control server.
         if let Some(pending) = control.close_for_shutdown() {
-            kind = pending;
-            final_kind = Some(pending);
+            next_kind = pending;
             continue;
         }
         break;
@@ -322,12 +317,20 @@ fn remove_owned_socket(path: &Path) {
     }
 }
 
-fn outcome_from_ack(command: Command, response: Response) -> CommandOutcome {
-    match command {
+fn outcome_from_ack(command: Command, response: Response) -> Result<CommandOutcome, SessionError> {
+    // A protocol-level refusal (for example a replacement declined during
+    // shutdown) is a failed command, not a successful controlled invocation.
+    // Propagate it so the CLI exits nonzero and shell callers can detect it.
+    if let Response::Error { message } = &response {
+        return Err(SessionError::Control {
+            detail: message.clone(),
+        });
+    }
+    Ok(match command {
         Command::Status { .. } => match response {
             Response::Ok { state } => CommandOutcome::Status(state),
             other => CommandOutcome::Controlled { response: other },
         },
         _ => CommandOutcome::Controlled { response },
-    }
+    })
 }

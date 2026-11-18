@@ -266,6 +266,48 @@ fn a_timed_out_provider_is_terminated_and_reported() {
 }
 
 #[test]
+fn an_oversized_provider_output_is_rejected_during_the_read() {
+    // A provider that emits far more than any character limit must be stopped
+    // while its output is still being read, not after an unbounded Vec is full.
+    let source = command_source(
+        "sh",
+        &["-c", "head -c 200000 /dev/zero | tr '\\0' a"],
+        2_000,
+    );
+    let started = Instant::now();
+    let err = source
+        .read_text()
+        .expect_err("oversized output must not be returned as text");
+    assert!(
+        matches!(err, SelectionError::OutputTooLarge { .. }),
+        "expected a bounded-read error, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the provider must be terminated promptly, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_output_byte_cap_follows_the_configured_character_limit() {
+    // Each character may take up to four UTF-8 bytes; the cap must leave room
+    // to detect the limit without allocating an unbounded buffer.
+    let source = command_source("sh", &["-c", "head -c 200 /dev/zero | tr '\\0' a"], 1_000)
+        .with_max_chars(5);
+    assert!(
+        matches!(
+            source.read_text(),
+            Err(SelectionError::OutputTooLarge { .. })
+        ),
+        "200 bytes exceeds the cap for a 5-character limit"
+    );
+
+    let at_limit = command_source("printf", &["abcde"], 1_000).with_max_chars(5);
+    assert_eq!(at_limit.read_text().expect("within cap"), "abcde");
+}
+
+#[test]
 fn a_missing_provider_binary_is_a_clear_error() {
     let source = command_source("murmduck-no-such-provider-xyz", &[], 1_000);
     let err = source.read_text().expect_err("spawn failure is an error");
