@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use super::SessionState;
 use super::body::Cancellation;
-use super::control::{ReadingKind, SessionControl};
+use super::control::SessionControl;
 use super::protocol::{self, Command, ProtocolError, Response, ResponseEnvelope};
+use super::routing;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -37,13 +38,6 @@ impl Default for ClientOptions {
             attempts: 30,
             backoff: Duration::from_millis(10),
         }
-    }
-}
-
-impl ClientOptions {
-    /// Bounded production defaults (roughly 300 ms of trying).
-    pub fn bounded() -> Self {
-        Self::default()
     }
 }
 
@@ -99,8 +93,10 @@ pub struct ControlServer;
 
 impl ControlServer {
     /// Serve control commands from `listener` until the returned handle is
-    /// shut down, using `cancel` as the whole session's cancellation. Kept for
-    /// callers with no replacement loop; Stop and replacement both signal it.
+    /// shut down, using `cancel` as the whole session's cancellation. Kept as
+    /// the simple-caller seam (used by the IPC tests); the owner, which supports
+    /// replacement, uses [`Self::spawn_with_control`]. Stop and replacement both
+    /// signal the supplied cancellation.
     pub fn spawn(
         listener: UnixListener,
         state: Arc<Mutex<SessionState>>,
@@ -173,31 +169,38 @@ fn handle_connection(
     }
 
     let response = match protocol::decode_command(&line) {
-        Ok(envelope) => match envelope.command {
-            Command::Stop => {
-                control.stop();
-                let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
-                *guard = SessionState::Stopping;
-                Response::Ok {
-                    state: SessionState::Stopping,
-                }
-            }
-            Command::ReplaceSelection | Command::ReplaceTestVoice => {
-                let kind = match envelope.command {
-                    Command::ReplaceTestVoice => ReadingKind::TestVoice,
-                    _ => ReadingKind::Selection,
-                };
+        Ok(envelope) => match routing::replacement_kind(envelope.command) {
+            Some(kind) => {
                 // Interrupt the current reading immediately; the owner loop
-                // then starts a fresh one before this socket is closed.
-                control.request_replace(kind);
-                let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
-                *guard = SessionState::Stopping;
-                Response::Ok {
-                    state: SessionState::Stopping,
+                // then starts a fresh one before this socket is closed. If it
+                // has already begun shutdown, decline explicitly (§6) instead
+                // of acknowledging a replacement that would be dropped.
+                if control.request_replace(kind) {
+                    let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+                    *guard = SessionState::Stopping;
+                    Response::Ok {
+                        state: SessionState::Stopping,
+                    }
+                } else {
+                    Response::Error {
+                        message: "session is shutting down; replacement declined".to_owned(),
+                    }
                 }
             }
-            Command::Status => Response::Ok {
-                state: *state.lock().unwrap_or_else(|err| err.into_inner()),
+            None => match envelope.command {
+                Command::Stop => {
+                    control.stop();
+                    let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+                    *guard = SessionState::Stopping;
+                    Response::Ok {
+                        state: SessionState::Stopping,
+                    }
+                }
+                Command::Status => Response::Ok {
+                    state: *state.lock().unwrap_or_else(|err| err.into_inner()),
+                },
+                // `replacement_kind` covers both replacement commands.
+                Command::ReplaceSelection | Command::ReplaceTestVoice => unreachable!(),
             },
         },
         Err(err) => Response::Error {

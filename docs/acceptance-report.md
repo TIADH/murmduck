@@ -54,20 +54,28 @@ adds the earlier milestone suites. New tests added by this ticket are marked
 
 ## 3. Requires the Fedora KDE Wayland target — NOT verified here
 
-These were **not** verified on this host. They are documented in
-`docs/installation.md` and must be checked manually on a fresh Fedora KDE
-Plasma Wayland installation:
+**Status: NOT verified — none of the criteria in this section are satisfied by
+this report.** Every row below is an open, target-only check; the "Verified"
+statuses in §2 apply *only* to the rows in that table, which use fakes on a
+headless host. In particular the two spec §14 criteria that are wholly about the
+target platform — "Murmduck operates on Fedora KDE Plasma Wayland" and "A fresh
+Fedora KDE Plasma installation can run Murmduck using documented setup
+instructions" — remain **unverified**, as do all the rows below. They are
+documented in `docs/installation.md` and must be checked manually on a fresh
+Fedora KDE Plasma Wayland installation:
 
-| Criterion | What must be checked on target | Why it cannot be checked here |
-| --- | --- | --- |
-| KDE Custom Shortcut start/stop | Configure the Global Shortcut as documented; select text, press shortcut → reading starts; press again → stops. | No KDE Plasma, no global shortcut daemon, no Wayland. |
-| Playback with no open terminal | Launch only via the KDE shortcut; confirm no terminal window appears and audio plays. | No desktop session; binary-level "process exits" is verified, but not KDE's launch environment. |
-| Focus preservation | Select text in Chromium/Zed/OpenCode Desktop/Alacritty/Konsole/Discord, press shortcut, confirm the same app keeps keyboard focus. No window should be raised. | No Wayland compositor or applications. The implementation never activates a window or changes the regular clipboard, but that is a code-level argument, not a runtime proof. |
-| Verified application matrix (§2) | Repeat the full workflow for all six applications listed in the spec. | No `wl-paste`, no Wayland, none of those apps. Their PRIMARY selection compatibility was already manually verified upstream, but the complete Murmduck workflow was not. |
-| Audible playback | `murmduck test-voice` must produce intelligible audio through PipeWire; MP3 decoder and sink plugins must load. | Headless VM; virtual PulseAudio sink does not drain in real time (ADR-0001). All audio tests use `fakesink`. |
-| Real RPM install on a fresh system | Build the tarball, build the RPM, `dnf install`, then run the documented setup using only the installed files. | No dnf/rpmbuild/fresh Fedora system. The spec file and helper are delivered but unexecuted here. |
-| API key from the graphical session | Set `~/.config/environment.d/murmduck.conf`, re-login, and confirm authenticated TTS works from the shortcut. | No graphical user session to inherit the variable. |
-| Executable discoverable by the graphical session | Confirm the absolute path in the KDE action works; or that a custom `PATH` from `environment.d` is inherited. | No KDE launch environment. |
+| Criterion | What must be checked on target | Why it cannot be checked here | Status |
+| --- | --- | --- | --- |
+| Operates on Fedora KDE Plasma Wayland (§14) | Install and run on Fedora KDE Plasma Wayland; perform every check in this section and §5. | Host is headless Ubuntu; no Fedora, no KDE, no Wayland. | NOT verified |
+| Fresh Fedora KDE install can run the documented setup (§14) | Follow `docs/installation.md` end-to-end on a clean Fedora KDE system. | No fresh Fedora install or RPM tooling here. | NOT verified |
+| KDE Custom Shortcut start/stop | Configure the Global Shortcut as documented; select text, press shortcut → reading starts; press again → stops. | No KDE Plasma, no global shortcut daemon, no Wayland. | NOT verified |
+| Playback with no open terminal | Launch only via the KDE shortcut; confirm no terminal window appears and audio plays. | No desktop session; binary-level "process exits" is verified, but not KDE's launch environment. | NOT verified |
+| Focus preservation | Select text in Chromium/Zed/OpenCode Desktop/Alacritty/Konsole/Discord, press shortcut, confirm the same app keeps keyboard focus. No window should be raised. | No Wayland compositor or applications. The implementation never activates a window or changes the regular clipboard, but that is a code-level argument, not a runtime proof. | NOT verified |
+| Verified application matrix (§2) | Repeat the full workflow for all six applications listed in the spec. | No `wl-paste`, no Wayland, none of those apps. Their PRIMARY selection compatibility was already manually verified upstream, but the complete Murmduck workflow was not. | NOT verified |
+| Audible playback | `murmduck test-voice` must produce intelligible audio through PipeWire; MP3 decoder and sink plugins must load. | Headless VM; virtual PulseAudio sink does not drain in real time (ADR-0001). All audio tests use `fakesink`. | NOT verified |
+| Real RPM install on a fresh system | Build the tarball, build the RPM, `dnf install`, then run the documented setup using only the installed files. | No dnf/rpmbuild/fresh Fedora system. The spec file and helper are delivered but unexecuted here. | NOT verified |
+| API key from the graphical session | Set `~/.config/environment.d/murmduck.conf`, re-login, and confirm authenticated TTS works from the shortcut. | No graphical user session to inherit the variable. | NOT verified |
+| Executable discoverable by the graphical session | Confirm the absolute path in the KDE action works; or that a custom `PATH` from `environment.d` is inherited. | No KDE launch environment. | NOT verified |
 
 ## 4. Honest limitations of the automated evidence
 
@@ -100,3 +108,33 @@ Plasma Wayland installation:
 7. With the TTS server stopped, press the shortcut; confirm a prompt error and
    that `murmduck status` reports `Inactive` with no leftover process/socket.
 8. Select > `max_chars` characters; confirm no request is sent.
+
+## 6. Scope decision: the fourth wire command (`ReplaceTestVoice`)
+
+Spec §6 lists the *initial* control commands `Stop`, `ReplaceSelection` and
+`Status`. Spec §7 additionally requires `murmduck test-voice` to "follow the
+same single-instance rules as normal playback", which includes replacing a
+reading already in progress. The three initial commands have no field describing
+*what* to read, so an active-session `test-voice` invocation cannot express
+"replace with the predefined sample" through them: reusing `ReplaceSelection`
+would read the PRIMARY selection instead of the sample and would silently do the
+wrong thing. We therefore keep a fourth, versioned wire command
+`ReplaceTestVoice`, mapped from the existing CLI `test-voice` command in one
+place (`src/session/routing.rs`). This is the smallest honest change that
+satisfies §7 without overloading the meaning of §6's commands. The command is
+covered by `tests/session_ipc.rs` and `tests/replacement.rs`.
+
+## 7. Deliberate seams retained (not speculative generality)
+
+- `SelectionProvider` has one variant because spec §9 requires the extraction
+  abstraction "to allow additional extraction methods later".
+- `ControlServer::spawn` is the simple-caller seam used by the IPC tests; the
+  coordinator uses `spawn_with_control`.
+- `ReadAloudSession::with_init_hook` is a deterministic cancellation-injection
+  seam used by `tests/cancellation.rs` to cancel between pipeline construction
+  and `start()`.
+- `PlaceholderSession` is a lightweight demo/test body; it no longer claims the
+  real pipeline is outstanding (that pipeline is implemented in
+  `ReadAloudSession`).
+- `LoggingConfig.level` stays a string because that is the documented TOML
+  shape; the typed boundary is `LoggingConfig::level_filter() -> LevelFilter`.

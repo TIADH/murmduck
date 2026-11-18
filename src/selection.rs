@@ -31,8 +31,9 @@ pub enum SelectionError {
     ProviderFailed { status: String, detail: String },
     /// The provider produced bytes that are not valid UTF-8.
     InvalidUtf8,
-    /// The provider did not finish within the configured timeout.
-    Timeout { after_ms: u64 },
+    /// The provider did not finish within the configured timeout. The domain
+    /// boundary uses `Duration`; the TOML key (`timeout_ms`) stays in config.
+    Timeout { after: Duration },
     /// The provider process could not be started.
     Spawn { detail: String },
     /// Reading the provider's output failed.
@@ -58,8 +59,12 @@ impl fmt::Display for SelectionError {
                 }
             }
             Self::InvalidUtf8 => write!(f, "selection provider returned invalid UTF-8 text"),
-            Self::Timeout { after_ms } => {
-                write!(f, "selection provider timed out after {after_ms} ms")
+            Self::Timeout { after } => {
+                write!(
+                    f,
+                    "selection provider timed out after {} ms",
+                    after.as_millis()
+                )
             }
             Self::Spawn { detail } => {
                 write!(f, "could not start selection provider: {detail}")
@@ -144,17 +149,11 @@ impl fmt::Debug for Selection {
     }
 }
 
-/// Read and validate the PRIMARY selection through `source`.
+/// Validate raw provider text and wrap it in a [`Selection`].
 ///
-/// Empty and oversized selections are rejected before any downstream work is
-/// possible. On success a size-only summary is logged and the text is returned
-/// inside [`Selection`]; the text itself is never written to logs.
-pub fn read_selection(
-    source: &dyn SelectionSource,
-    config: &SelectionConfig,
-) -> Result<Selection, SelectionError> {
-    let text = source.read_text()?;
-
+/// Shared by both read paths so empty/oversized handling cannot drift. Only a
+/// size summary is logged — never the text itself.
+fn validate_selection(text: String, config: &SelectionConfig) -> Result<Selection, SelectionError> {
     if text.is_empty() {
         return Err(SelectionError::Empty);
     }
@@ -171,6 +170,18 @@ pub fn read_selection(
     Ok(Selection { text })
 }
 
+/// Read and validate the PRIMARY selection through `source`.
+///
+/// Empty and oversized selections are rejected before any downstream work is
+/// possible. On success a size-only summary is logged and the text is returned
+/// inside [`Selection`]; the text itself is never written to logs.
+pub fn read_selection(
+    source: &dyn SelectionSource,
+    config: &SelectionConfig,
+) -> Result<Selection, SelectionError> {
+    validate_selection(source.read_text()?, config)
+}
+
 /// Cancellation-aware counterpart to [`read_selection`]. A cancelled read
 /// reports [`SelectionError::Cancelled`] and guarantees the provider process
 /// has been terminated and reaped before returning.
@@ -179,21 +190,7 @@ pub fn read_selection_cancellable(
     config: &SelectionConfig,
     cancel: &Cancellation,
 ) -> Result<Selection, SelectionError> {
-    let text = source.read_text_cancellable(cancel)?;
-
-    if text.is_empty() {
-        return Err(SelectionError::Empty);
-    }
-    let char_count = text.chars().count();
-    if char_count > config.max_chars {
-        return Err(SelectionError::TooLong {
-            max: config.max_chars,
-            actual: char_count,
-        });
-    }
-
-    logging::log_selection_summary(&text);
-    Ok(Selection { text })
+    validate_selection(source.read_text_cancellable(cancel)?, config)
 }
 
 /// Build the human-readable, text-free report for a successful read.
@@ -259,7 +256,7 @@ impl WaylandPrimary {
 
     fn timeout_error(&self) -> SelectionError {
         SelectionError::Timeout {
-            after_ms: self.timeout.as_millis() as u64,
+            after: self.timeout,
         }
     }
 }

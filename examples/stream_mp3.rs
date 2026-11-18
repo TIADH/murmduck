@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = StreamConfig {
+        volume: 1.0,
         max_bytes: 64 * 1024,
         max_latency: Duration::from_millis(20),
         capture_decoded: false,

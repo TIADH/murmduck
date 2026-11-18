@@ -46,8 +46,11 @@ impl AudioSink {
 }
 
 /// Bounded-buffering and decoder tuning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StreamConfig {
+    /// Playback volume from `audio.volume`, in `0.0..=1.0`. Applied by a
+    /// `volume` element in the pipeline; `1.0` is the neutral default.
+    pub volume: f32,
     /// Hard cap on bytes queued in `appsrc`; `push` back-pressures past this.
     pub max_bytes: u64,
     /// Forwarded to `appsrc`'s `max-latency` property for latency reporting.
@@ -61,6 +64,7 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
+            volume: 1.0,
             max_bytes: 64 * 1024,
             max_latency: Duration::from_millis(20),
             capture_decoded: false,
@@ -135,6 +139,8 @@ pub struct StreamingMp3Player {
     pipeline: gst::Pipeline,
     appsrc: AppSrc,
     sink: gst::Element,
+    /// The `volume` element, kept so the applied value is observable.
+    volume_element: gst::Element,
     bus: gst::Bus,
     inner: Arc<Mutex<Inner>>,
     cancelled: Arc<AtomicBool>,
@@ -210,6 +216,13 @@ impl StreamingMp3Player {
         if matches!(sink, AudioSink::SyncedFake) {
             sink_element.set_property("sync", true);
         }
+        // `audio.volume` is applied here, just before the sink, so it works for
+        // every sink type (including real devices) and is observable in tests.
+        let volume_element = gst::ElementFactory::make("volume")
+            .name("volume")
+            .build()
+            .map_err(|err| AudioError::Pipeline(format!("volume: {err}")))?;
+        volume_element.set_property("volume", f64::from(config.volume));
 
         pipeline
             .add_many([
@@ -218,6 +231,7 @@ impl StreamingMp3Player {
                 &decoder,
                 &convert,
                 &resample,
+                &volume_element,
                 &sink_element,
             ])
             .map_err(|err| AudioError::Pipeline(format!("add elements: {err}")))?;
@@ -227,6 +241,7 @@ impl StreamingMp3Player {
             &decoder,
             &convert,
             &resample,
+            &volume_element,
             &sink_element,
         ])
         .map_err(|err| AudioError::Pipeline(format!("link elements: {err}")))?;
@@ -260,6 +275,7 @@ impl StreamingMp3Player {
             pipeline,
             appsrc,
             sink: sink_element,
+            volume_element,
             bus,
             inner,
             cancelled,
@@ -382,6 +398,19 @@ impl StreamingMp3Player {
     /// Collected lifecycle events, in order.
     pub fn events(&self) -> Vec<PlayerEvent> {
         self.inner.lock().expect("lock player state").events.clone()
+    }
+
+    /// True once the decoded-buffer probe has observed playback starting.
+    ///
+    /// Exposed so callers can drive their own state from the player instead of
+    /// scanning [`Self::events`] for [`PlayerEvent::Started`].
+    pub fn has_started(&self) -> bool {
+        self.inner.lock().expect("lock player state").started
+    }
+
+    /// The volume actually applied to the pipeline (read back from the element).
+    pub fn volume(&self) -> f64 {
+        self.volume_element.property::<f64>("volume")
     }
 
     /// Bytes currently queued in `appsrc`.

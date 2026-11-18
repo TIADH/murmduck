@@ -1,8 +1,18 @@
 //! TOML configuration loading, defaults, validation and path resolution.
 //!
-//! Configuration is read fresh on each invocation. Missing files and omitted
-//! keys fall back to documented defaults; invalid values fail before any
-//! selection, network or audio work begins.
+//! # Defaulting policy (spec §8)
+//!
+//! Configuration is read fresh on each invocation. A missing file, a missing
+//! section, or an omitted key is **not** an error: it falls back to the
+//! documented default (this is required so a minimal config works, ticket #2).
+//! In particular there are no mandatory keys whose mere absence fails loading.
+//!
+//! A value that *is* present but malformed is an error, and the error names the
+//! full dotted key (e.g. `tts.base_url`) so the user can fix it. These errors
+//! are raised before any selection, network or audio work begins. Values that
+//! are present but semantically invalid (empty `tts.model`, non-finite
+//! `tts.speed`, out-of-range `audio.volume`, …) are rejected by [`Config::validate`]
+//! with the same key-named wording.
 
 use std::error::Error;
 use std::ffi::OsStr;
@@ -55,9 +65,35 @@ pub enum ResponseFormat {
     Mp3,
 }
 
+/// Wrap a field's deserialization error so it names the offending dotted key.
+///
+/// A raw `toml` error reports a line and column but not the key (for example
+/// `invalid type: integer `42`, expected a string`). Spec §8 requires a useful
+/// error for invalid values, so every configured value goes through one of
+/// these small adapters.
+macro_rules! keyed_field {
+    ($fn_name:ident, $type:ty, $key:literal) => {
+        fn $fn_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<$type, D::Error> {
+            <$type>::deserialize(deserializer)
+                .map_err(|err| de::Error::custom(format!(concat!($key, ": {}"), err)))
+        }
+    };
+}
+
+keyed_field!(deserialize_base_url, String, "tts.base_url");
+keyed_field!(deserialize_tts_model, String, "tts.model");
+keyed_field!(deserialize_tts_voice, String, "tts.voice");
+keyed_field!(deserialize_tts_speed, f32, "tts.speed");
+keyed_field!(deserialize_api_key_env, Option<String>, "tts.api_key_env");
+keyed_field!(deserialize_volume, f32, "audio.volume");
+keyed_field!(deserialize_max_chars, usize, "selection.max_chars");
+keyed_field!(deserialize_timeout_ms, u64, "selection.timeout_ms");
+keyed_field!(deserialize_log_level, String, "logging.level");
+
 impl<'de> Deserialize<'de> for ResponseFormat {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
+        let value = String::deserialize(deserializer)
+            .map_err(|err| de::Error::custom(format!("tts.response_format: {err}")))?;
         match value.as_str() {
             "mp3" => Ok(Self::Mp3),
             other => Err(de::Error::custom(format!(
@@ -67,8 +103,10 @@ impl<'de> Deserialize<'de> for ResponseFormat {
     }
 }
 
-/// Selection source. Kept as an enum so later providers can be added without
-/// changing the config shape.
+/// Selection source. Spec §9 asks for the provider behind a small abstraction
+/// "to allow additional extraction methods later"; the config shape therefore
+/// stays an enum even though the MVP has a single variant. This is deliberate,
+/// not speculative generality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SelectionProvider {
     #[default]
@@ -77,7 +115,8 @@ pub enum SelectionProvider {
 
 impl<'de> Deserialize<'de> for SelectionProvider {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
+        let value = String::deserialize(deserializer)
+            .map_err(|err| de::Error::custom(format!("selection.provider: {err}")))?;
         match value.as_str() {
             "wayland-primary" => Ok(Self::WaylandPrimary),
             other => Err(de::Error::custom(format!(
@@ -91,11 +130,16 @@ impl<'de> Deserialize<'de> for SelectionProvider {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TtsConfig {
+    #[serde(deserialize_with = "deserialize_base_url")]
     pub base_url: String,
     /// Name of the environment variable holding the API key (never the key itself).
+    #[serde(deserialize_with = "deserialize_api_key_env")]
     pub api_key_env: Option<String>,
+    #[serde(deserialize_with = "deserialize_tts_model")]
     pub model: String,
+    #[serde(deserialize_with = "deserialize_tts_voice")]
     pub voice: String,
+    #[serde(deserialize_with = "deserialize_tts_speed")]
     pub speed: f32,
     pub response_format: ResponseFormat,
 }
@@ -162,6 +206,7 @@ impl TtsConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
+    #[serde(deserialize_with = "deserialize_volume")]
     pub volume: f32,
 }
 
@@ -188,7 +233,9 @@ impl AudioConfig {
 #[serde(default)]
 pub struct SelectionConfig {
     pub provider: SelectionProvider,
+    #[serde(deserialize_with = "deserialize_max_chars")]
     pub max_chars: usize,
+    #[serde(deserialize_with = "deserialize_timeout_ms")]
     pub timeout_ms: u64,
 }
 
@@ -203,6 +250,13 @@ impl Default for SelectionConfig {
 }
 
 impl SelectionConfig {
+    /// The configured timeout as a `Duration` — the value used at the domain
+    /// boundary by [`crate::selection::WaylandPrimary`]. `timeout_ms` remains a
+    /// `u64` only because that is the documented TOML key.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.max_chars == 0 {
             return Err(ConfigError::Invalid(
@@ -222,7 +276,11 @@ impl SelectionConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
-    /// A tracing level filter such as `info`, `debug` or `warn`.
+    /// A tracing level filter such as `info`, `debug` or `warn`. Stored as the
+    /// documented TOML string and converted once by [`Self::level_filter`];
+    /// making the field itself a `LevelFilter` would change the public config
+    /// shape and the documented parsing, so the typed boundary is that method.
+    #[serde(deserialize_with = "deserialize_log_level")]
     pub level: String,
 }
 

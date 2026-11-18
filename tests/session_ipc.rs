@@ -160,3 +160,47 @@ fn a_client_gives_up_within_a_bounded_time_when_nobody_listens() {
     let err = ipc::send_command(&socket, Command::Stop, &options).expect_err("no listener");
     assert!(matches!(err, ipc::ClientError::Unavailable), "{err:?}");
 }
+
+#[test]
+fn a_replacement_arriving_during_shutdown_is_declined_not_dropped() {
+    use murmduck::session::ReadingKind;
+
+    // A replace accepted just before shutdown is returned to the owner so it
+    // is actually started; one arriving after shutdown began gets a clear
+    // "declined" acknowledgement instead of Ok-then-nothing.
+    let control = murmduck::session::SessionControl::new();
+    assert!(control.request_replace(ReadingKind::Selection));
+    assert_eq!(
+        control.close_for_shutdown(),
+        Some(ReadingKind::Selection),
+        "a pending replacement must not be lost"
+    );
+    assert!(
+        !control.request_replace(ReadingKind::Selection),
+        "further replacements are refused once shutdown began"
+    );
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+    let control = murmduck::session::SessionControl::new();
+    let mut server = ControlServer::spawn_with_control(
+        listener,
+        Arc::new(Mutex::new(SessionState::Stopping)),
+        control.clone(),
+    );
+    control.close_for_shutdown();
+
+    let ack = ipc::send_command(&socket, Command::ReplaceSelection, &fast_options())
+        .expect("client delivers");
+    assert!(
+        matches!(&ack.response, Response::Error { message } if message.contains("declined")),
+        "the client must be told the replacement was declined: {:?}",
+        ack.response
+    );
+    assert!(
+        !control.replace_requested(),
+        "a declined replacement must not be queued"
+    );
+    server.shutdown();
+}

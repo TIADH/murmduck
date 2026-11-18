@@ -1,13 +1,13 @@
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
-use murmduck::audio::AudioSink;
+use murmduck::audio::{AudioSink, StreamConfig};
 use murmduck::cli::{Cli, Command};
 use murmduck::selection::{self, SelectionSource, StaticSource, WaylandPrimary};
 use murmduck::session::body::{NoopBody, ReadAloudSession, SessionBody, SessionContext};
 use murmduck::session::coordinator::{self, ClientRetry};
 use murmduck::session::paths::RuntimePaths;
+use murmduck::session::routing;
 use murmduck::session::{ReadingKind, SessionError, TeardownStep};
 use murmduck::{config, logging};
 
@@ -47,6 +47,11 @@ fn make_body<S: SelectionSource>(
         api_key,
         AudioSink::Auto,
     )
+    .with_stream_config(StreamConfig {
+        // §8: audio.volume must reach the audio pipeline, not be a parsed no-op.
+        volume: config.audio.volume,
+        ..StreamConfig::default()
+    })
 }
 
 /// Build a fresh reading for each attempt the session owner runs.
@@ -56,14 +61,11 @@ fn reading_factory(
 ) -> impl FnMut(ReadingKind) -> AppBody {
     let config = config.clone();
     move |kind| match kind {
-        ReadingKind::Selection => {
-            let timeout = Duration::from_millis(config.selection.timeout_ms);
-            AppBody::Selection(make_body(
-                &config,
-                api_key.clone(),
-                WaylandPrimary::new(timeout),
-            ))
-        }
+        ReadingKind::Selection => AppBody::Selection(make_body(
+            &config,
+            api_key.clone(),
+            WaylandPrimary::new(config.selection.timeout()),
+        )),
         ReadingKind::TestVoice => AppBody::TestVoice(make_body(
             &config,
             api_key.clone(),
@@ -111,22 +113,43 @@ fn dispatch(
     let runtime = RuntimePaths::from_env()?;
     let retry = ClientRetry::default();
 
-    let outcome = match command {
-        Command::Toggle | Command::ReadSelection | Command::TestVoice => {
-            let factory = reading_factory(config, api_key);
-            coordinator::run_with_factory(&runtime, command, factory, &retry)?
-        }
-        Command::Stop => coordinator::run(&runtime, Command::Stop, NoopBody, &retry)?,
-        Command::Status { json } => {
-            let outcome = coordinator::run(&runtime, Command::Status { json }, NoopBody, &retry)?;
-            if json {
-                println!("{}", outcome.report_json());
-            } else {
-                println!("{}", outcome.report());
+    let outcome = if routing::starts_session(command) {
+        let factory = reading_factory(config, api_key);
+        coordinator::run_with_factory(&runtime, command, factory, &retry)?
+    } else {
+        match command {
+            Command::Stop => coordinator::run(&runtime, Command::Stop, NoopBody, &retry)?,
+            Command::Status { json } => {
+                let outcome =
+                    coordinator::run(&runtime, Command::Status { json }, NoopBody, &retry)?;
+                if json {
+                    println!("{}", outcome.report_json());
+                } else {
+                    println!("{}", outcome.report());
+                }
+                return Ok(());
             }
-            return Ok(());
+            // `starts_session` covers the three audio-producing commands.
+            Command::Toggle | Command::ReadSelection | Command::TestVoice => unreachable!(),
         }
     };
     println!("{}", outcome.report());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_audio_volume_reaches_the_reading_body() {
+        let mut cfg = config::Config::default();
+        cfg.audio.volume = 0.25;
+        let body = make_body(&cfg, None, selection::StaticSource::new("sample"));
+        assert_eq!(
+            body.stream_config().volume,
+            0.25,
+            "audio.volume must be wired from config into the audio pipeline"
+        );
+    }
 }

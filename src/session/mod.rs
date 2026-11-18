@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod lock;
 pub mod paths;
 pub mod protocol;
+pub mod routing;
 
 pub use control::{ReadingKind, SessionControl};
 

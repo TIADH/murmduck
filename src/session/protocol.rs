@@ -22,6 +22,14 @@ pub enum Command {
     /// Replace the current reading with a fresh PRIMARY selection.
     ReplaceSelection,
     /// Replace the current reading with the predefined test-voice sample.
+    ///
+    /// Spec §6 lists the *initial* wire commands (`Stop`, `ReplaceSelection`,
+    /// `Status`), while §7 requires `test-voice` to follow the same
+    /// single-instance rules as normal playback — including replacing a
+    /// running reading. Those three commands carry no field describing *what*
+    /// to read, so an active-session `test-voice` cannot be expressed through
+    /// them. This fourth, versioned command is the smallest honest extension;
+    /// the decision is recorded in `docs/acceptance-report.md` §6.
     ReplaceTestVoice,
     /// Ask for the owner's current lifecycle state.
     Status,

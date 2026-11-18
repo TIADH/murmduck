@@ -18,6 +18,7 @@ fn fixture() -> Vec<u8> {
 
 fn capture_config() -> StreamConfig {
     StreamConfig {
+        volume: 1.0,
         max_bytes: 256 * 1024,
         max_latency: Duration::from_millis(20),
         capture_decoded: true,
@@ -97,6 +98,7 @@ fn an_underrun_is_reported_and_playback_recovers_cleanly() {
     let baseline = decode(&[&bytes]);
     let split = bytes.len() / 3;
     let config = StreamConfig {
+        volume: 1.0,
         max_bytes: 1024,
         max_latency: Duration::from_millis(5),
         capture_decoded: true,
@@ -219,4 +221,41 @@ fn buffering_stays_bounded_when_the_sink_is_slower_than_the_feed() {
         stats.max_buffered_bytes
     );
     assert!(stats.decoded_bytes > 0, "no decoded audio was produced");
+}
+
+#[test]
+fn configured_volume_is_applied_to_the_pipeline() {
+    // §8: audio.volume is a real playback setting, not a parsed no-op.
+    let player = StreamingMp3Player::new(
+        AudioSink::Fake,
+        StreamConfig {
+            volume: 0.42,
+            ..StreamConfig::default()
+        },
+    )
+    .expect("create player with a configured volume");
+    assert!(
+        (player.volume() - 0.42).abs() < 1e-6,
+        "the configured volume must reach the audio pipeline: {}",
+        player.volume()
+    );
+
+    let default_player =
+        StreamingMp3Player::new(AudioSink::Fake, StreamConfig::default()).expect("default player");
+    assert_eq!(default_player.volume(), 1.0);
+}
+
+#[test]
+fn has_started_tracks_the_playback_probe_without_reading_events() {
+    let player = StreamingMp3Player::new(AudioSink::Fake, capture_config()).expect("create player");
+    assert!(!player.has_started(), "not started before playback");
+    player.start().expect("start pipeline");
+    for chunk in fixture().chunks(512) {
+        player.push(chunk).expect("push chunk");
+    }
+    assert!(
+        wait_for(|| player.has_started(), Duration::from_secs(2)),
+        "has_started() must become true once decoded audio reaches the sink"
+    );
+    player.finish().expect("finish playback");
 }

@@ -9,8 +9,6 @@
 //! ignored) the moment cancellation is signalled: dropping an in-flight
 //! `reqwest` request closes the connection, which is what makes a second
 //! `toggle` responsive while the server is connecting or stalling mid-stream.
-//! [`TtsClient::speak_to`] keeps the text-only, non-cancellable form for
-//! callers that do not drive a session lifecycle.
 
 use std::error::Error;
 use std::fmt;
@@ -119,14 +117,9 @@ impl TtsClient {
     }
 
     /// Send `text` to the TTS endpoint and stream the response body into
-    /// `sink` as it arrives. Returns the number of bytes written.
-    pub fn speak_to(&self, text: &str, sink: &mut dyn Write) -> Result<u64, TtsError> {
-        self.speak_to_cancellable(text, sink, &Cancellation::new())
-    }
-
-    /// Like [`Self::speak_to`], but aborts the request promptly when `cancel`
-    /// is signalled — whether the request is still connecting or already
-    /// streaming. The caller's sink sees no bytes after cancellation.
+    /// `sink` as it arrives. Aborts the request promptly when `cancel` is
+    /// signalled — whether the request is still connecting or already
+    /// streaming — so the caller's sink sees no bytes after cancellation.
     pub fn speak_to_cancellable(
         &self,
         text: &str,

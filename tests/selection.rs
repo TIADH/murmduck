@@ -253,7 +253,12 @@ fn a_timed_out_provider_is_terminated_and_reported() {
     let err = source.read_text().expect_err("timeout is an error");
     let elapsed = started.elapsed();
 
-    assert_eq!(err, SelectionError::Timeout { after_ms: 120 });
+    assert_eq!(
+        err,
+        SelectionError::Timeout {
+            after: Duration::from_millis(120)
+        }
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "provider should be killed promptly, took {elapsed:?}"

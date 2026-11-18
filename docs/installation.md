@@ -114,6 +114,12 @@ level = "info"
 
 Key points:
 
+- **Defaulting policy:** the file, any section, and any individual key may be
+  omitted; omitted values use the defaults shown above. A value that is present
+  but malformed is rejected before any session work with an error naming the
+  full key (for example `tts.speed`), and a present value that is semantically
+  invalid (empty `tts.model`, out-of-range `audio.volume`, …) is rejected the
+  same way.
 - `api_key_env` is the **name** of an environment variable, never the secret.
   Omit it for servers without authentication.
 - `selection.max_chars` is a limit in Unicode **characters**, not bytes.

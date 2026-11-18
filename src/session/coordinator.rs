@@ -26,7 +26,8 @@ use super::control::{ReadingKind, SessionControl};
 use super::ipc::{self, ClientError, ClientOptions, ControlServer};
 use super::lock::InstanceLock;
 use super::paths::RuntimePaths;
-use super::protocol::{Command as WireCommand, Response};
+use super::protocol::Response;
+use super::routing;
 use super::{SessionError, SessionState, TeardownStep};
 
 /// Retry policy used while looking for a live owner.
@@ -45,7 +46,7 @@ impl Default for ClientRetry {
         Self {
             lock_attempts: 5,
             lock_backoff: Duration::from_millis(20),
-            connect: ClientOptions::bounded(),
+            connect: ClientOptions::default(),
         }
     }
 }
@@ -133,8 +134,11 @@ where
     for attempt in 0..retry.lock_attempts {
         match InstanceLock::try_acquire(&paths.lock)? {
             Some(guard) => return handle_idle(paths, command, guard, &mut factory),
-            None => match ipc::send_command(&paths.socket, client_command(command), &retry.connect)
-            {
+            None => match ipc::send_command(
+                &paths.socket,
+                routing::wire_command(command),
+                &retry.connect,
+            ) {
                 Ok(ack) => return Ok(outcome_from_ack(command, ack.response)),
                 Err(ClientError::Unavailable) => {
                     // The owner may have exited or not created its socket yet.
@@ -170,11 +174,12 @@ where
         // Starting a session needs the body. `guard` is kept alive for the
         // whole run by `become_owner`.
         Command::Toggle | Command::ReadSelection | Command::TestVoice => {
-            let kind = match command {
-                Command::TestVoice => ReadingKind::TestVoice,
-                _ => ReadingKind::Selection,
-            };
-            become_owner(paths, guard, factory, kind)?;
+            become_owner(
+                paths,
+                guard,
+                factory,
+                routing::initial_reading_kind(command),
+            )?;
             Ok(CommandOutcome::SessionRan)
         }
         // `guard` is released as this function returns: nothing was started.
@@ -217,6 +222,8 @@ where
     let mut kind = initial_kind;
     let mut first_error: Option<SessionError> = None;
     let mut last_body: Option<B> = None;
+    // A replacement accepted in the shutdown window; run it before closing.
+    let mut final_kind: Option<ReadingKind> = None;
     loop {
         if control.stop_requested() {
             break;
@@ -226,7 +233,7 @@ where
         // arriving *during* it is seen on the next iteration.
         control.clear_replace();
         let attempt = Cancellation::new();
-        control.set_attempt(attempt.clone());
+        control.set_attempt_cancel(attempt.clone());
         if control.stop_requested() {
             attempt.cancel();
         }
@@ -239,7 +246,8 @@ where
             cancel: attempt,
             state: Arc::clone(&state),
         };
-        let mut body = factory(kind);
+        let reading_kind = final_kind.take().unwrap_or(kind);
+        let mut body = factory(reading_kind);
         let result = body.run(&context);
         let failed = result.is_err();
         if first_error.is_none() {
@@ -247,10 +255,22 @@ where
         }
         last_body = Some(body);
 
-        if failed || control.stop_requested() || !control.replace_requested() {
+        if failed || control.stop_requested() {
             break;
         }
-        kind = control.replacement_kind();
+        if control.replace_requested() {
+            kind = control.replacement_kind();
+            continue;
+        }
+        // §6: close the shutdown race atomically. A replacement that arrived
+        // after the last check is returned and run; one arriving afterwards is
+        // declined with an explicit acknowledgement by the control server.
+        if let Some(pending) = control.close_for_shutdown() {
+            kind = pending;
+            final_kind = Some(pending);
+            continue;
+        }
+        break;
     }
 
     // Teardown order (spec §10): the body has already stopped accepting audio,
@@ -299,17 +319,6 @@ fn remove_owned_socket(path: &Path) {
         && metadata.file_type().is_socket()
     {
         let _ = fs::remove_file(path);
-    }
-}
-
-/// The wire command a control client sends to an existing owner.
-fn client_command(command: Command) -> WireCommand {
-    match command {
-        // A second `toggle` cancels the current session (spec §4).
-        Command::Toggle | Command::Stop => WireCommand::Stop,
-        Command::ReadSelection => WireCommand::ReplaceSelection,
-        Command::TestVoice => WireCommand::ReplaceTestVoice,
-        Command::Status { .. } => WireCommand::Status,
     }
 }
 

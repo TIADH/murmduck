@@ -117,6 +117,17 @@ fn invalid_values_produce_actionable_errors() {
 }
 
 #[test]
+fn malformed_required_tts_values_name_the_offending_key() {
+    // §8: a present-but-malformed TTS value must say *which* key is wrong.
+    // A bare TOML parse dump ("invalid type: integer") does not.
+    assert_rejected("[tts]\nbase_url = 42\n", "tts.base_url");
+    assert_rejected("[tts]\nmodel = 42\n", "tts.model");
+    assert_rejected("[tts]\nvoice = 42\n", "tts.voice");
+    assert_rejected("[tts]\nspeed = \"fast\"\n", "tts.speed");
+    assert_rejected("[tts]\nresponse_format = 42\n", "tts.response_format");
+}
+
+#[test]
 fn malformed_toml_reports_the_config_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("config.toml");
