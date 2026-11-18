@@ -65,6 +65,8 @@ struct ReceivedRequest {
 struct ServerConfig {
     status: u16,
     chunks: Vec<Vec<u8>>,
+    /// Declared audio type of the streamed body.
+    content_type: &'static str,
     /// When set, the server sends `chunks[0]`, waits on this receiver, then
     /// sends the rest — letting a test observe playback before the full body.
     release: Option<mpsc::Receiver<()>>,
@@ -78,6 +80,7 @@ impl ServerConfig {
         Self {
             status: 200,
             chunks,
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: None,
         }
@@ -89,6 +92,7 @@ impl ServerConfig {
         Self {
             status: 200,
             chunks,
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: Some(delay),
         }
@@ -98,6 +102,7 @@ impl ServerConfig {
         Self {
             status,
             chunks: Vec::new(),
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: None,
         }
@@ -247,7 +252,8 @@ fn serve_one(
 
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        config.content_type
     );
     for (index, chunk) in config.chunks.iter().enumerate() {
         if index == 1
@@ -313,18 +319,22 @@ fn retry() -> Retry {
 fn wav_response_format_reaches_both_the_tts_request_and_the_audio_pipeline() {
     let bytes = wav_stream(1, 48_000, 24_000);
     let midpoint = bytes.len() / 2;
-    let server = FakeTtsServer::spawn(ServerConfig::ok(vec![
-        bytes[..midpoint].to_vec(),
-        bytes[midpoint..].to_vec(),
-    ]));
-    let dir = tempfile::tempdir().expect("temp dir");
-    let runtime = paths(&dir);
+    let (release, gate) = mpsc::channel();
+    let server = FakeTtsServer::spawn(ServerConfig {
+        status: 200,
+        chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        // A WAV-only server declares `audio/wav`; this must pass the HTTP
+        // content-type gate and reach the WAV decode path.
+        content_type: "audio/wav",
+        release: Some(gate),
+        chunk_delay: None,
+    });
     let report = Arc::new(Mutex::new(SessionReport::default()));
     let config = TtsConfig {
         response_format: ResponseFormat::Wav,
         ..tts_config(&server)
     };
-    let body = ReadAloudSession::new(
+    let mut body = ReadAloudSession::new(
         FakeSource::new("WAV selection."),
         SelectionConfig::default(),
         config,
@@ -332,10 +342,22 @@ fn wav_response_format_reaches_both_the_tts_request_and_the_audio_pipeline() {
         AudioSink::Fake,
     )
     .with_report(Arc::clone(&report));
+    let state = Arc::new(Mutex::new(SessionState::Starting));
+    let ctx = SessionContext {
+        cancel: Cancellation::new(),
+        state: Arc::clone(&state),
+    };
 
-    let outcome = coordinator::run(&runtime, Command::Toggle, body, &retry())
-        .expect("a WAV session completes");
-    assert!(matches!(outcome, CommandOutcome::SessionRan), "{outcome:?}");
+    let owner = thread::spawn(move || body.run(&ctx));
+    assert!(
+        wait_for(
+            || *state.lock().expect("state lock") == SessionState::Playing,
+            Duration::from_secs(5)
+        ),
+        "WAV playback must start while the server still holds the second half"
+    );
+    release.send(()).expect("release the second half");
+    owner.join().expect("body joins").expect("WAV body succeeds");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "exactly one TTS request");
@@ -344,6 +366,7 @@ fn wav_response_format_reaches_both_the_tts_request_and_the_audio_pipeline() {
     let report = report.lock().expect("report lock");
     assert_eq!(report.bytes_pushed, bytes.len() as u64);
     assert!(report.decoded_bytes > 0, "WAV audio must reach the sink");
+    server.join();
 }
 
 #[test]
@@ -421,6 +444,7 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
     let server = FakeTtsServer::spawn(ServerConfig {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        content_type: "audio/mpeg",
         release: Some(gate),
         chunk_delay: None,
     });
@@ -509,6 +533,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
     let server = FakeTtsServer::spawn(ServerConfig {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        content_type: "audio/mpeg",
         release: Some(gate),
         chunk_delay: None,
     });

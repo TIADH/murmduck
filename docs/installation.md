@@ -18,16 +18,19 @@ Why each is needed:
 | --- | --- |
 | `wl-clipboard` | Supplies `wl-paste`, used as `wl-paste --primary --no-newline`. |
 | `gstreamer1`, `gstreamer1-plugins-base` | Core, `mpegaudioparse`, `audioconvert`, `audioresample`. |
-| `gstreamer1-plugins-good` | Audio output plugins (e.g. `pulsesink`) for the Wayland/PipeWire session. |
-| `gstreamer1-plugins-ugly-free` | Provides the MP3 decoder (`mpg123audiodec`) on Fedora. |
+| `gstreamer1-plugins-good` | Audio output plugins (e.g. `pulsesink`) for the Wayland/PipeWire session, and `wavparse` for WAV responses. |
+| `gstreamer1-plugins-ugly-free` | MP3-only decoder (`mpg123audiodec`) on Fedora; not needed if you use WAV. |
 
 If MP3 playback fails with a missing-element error, check which enabled
 repository provides `mpg123audiodec` on your Fedora release and install that
-plugin package; the pipeline requires MPEG-1 Layer III decoding.
+plugin package; the MP3 pipeline requires MPEG-1 Layer III decoding. WAV
+playback needs `wavparse` instead, which ships in `gstreamer1-plugins-good` and
+is installed by the command above.
 
 You also need an OpenAI-compatible TTS server that accepts
-`POST {base_url}/audio/speech` and returns `audio/mpeg`. The MVP assumes MPEG-1
-MP3 (see ADR-0001).
+`POST {base_url}/audio/speech` and returns `audio/mpeg` or `audio/wav`, matching
+`tts.response_format`. The MPEG-1 assumption in ADR-0001 applies to MP3 only;
+WAV streams may carry placeholder RIFF/data lengths.
 
 ## 2. Build prerequisites
 
@@ -92,7 +95,7 @@ api_key_env = "MURMDUCK_API_KEY"   # remove for an unauthenticated server
 model = "tts-1"
 voice = "alloy"
 speed = 1.0
-response_format = "mp3"
+response_format = "mp3"   # "mp3" (default) or "wav"
 
 [audio]
 volume = 1.0
@@ -119,7 +122,10 @@ Key points:
 - `selection.max_chars` is a limit in Unicode **characters**, not bytes.
 - `selection.timeout_ms` bounds how long `wl-paste` may run.
 - `logging.level` is one of `off`, `error`, `warn`, `info`, `debug`, `trace`.
-- Only `response_format = "mp3"` is supported in the MVP.
+- `response_format` is `"mp3"` (the default) or `"wav"`. WAV is for servers that
+  only emit WAV (for example VieNeu-TTS), including streams with placeholder
+  RIFF/data lengths; it needs `wavparse` from `gstreamer1-plugins-good`. Raw PCM
+  is not supported.
 
 Check the effective configuration non-interactively:
 
@@ -207,7 +213,7 @@ to the same command regardless of which application is focused.
 | "could not start selection provider" | `wl-clipboard` is missing or not on the graphical session's `PATH`. |
 | "TTS server returned HTTP …" | Check `base_url`, model/voice, and server logs. |
 | Connection refused | TTS server is down or `base_url` is wrong. The session exits and releases its resources. |
-| No sound | Check the GStreamer MP3 decoder and audio sink plugins, and that PipeWire/PulseAudio has a default sink. Use `murmduck test-voice` to isolate playback. |
+| No sound | Check the GStreamer decoder for your format (`mpg123audiodec` for MP3, `wavparse` for WAV) and the audio sink plugins, and that PipeWire/PulseAudio has a default sink. Use `murmduck test-voice` to isolate playback. |
 | API key not found | The variable must exist in the graphical session (see above), not only in your shell. |
 | Shortcut does nothing | Use the absolute executable path in the KDE action; confirm `murmduck --version` works as the same user. |
 
