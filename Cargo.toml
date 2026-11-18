@@ -1,0 +1,29 @@
+[package]
+name = "murmduck"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight, on-demand streaming text-to-speech for Linux"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+libc = "0.2"
+reqwest = { version = "0.11", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
