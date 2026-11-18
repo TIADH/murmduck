@@ -216,6 +216,130 @@ fn stop_and_status_do_not_require_the_api_key_to_be_set() {
 }
 
 #[test]
+fn toggle_without_credentials_stops_an_active_owner() {
+    // A second `toggle` only sends Stop over IPC. It must reach the owner even
+    // when this invocation has no TTS credentials: resolution belongs to the
+    // process that actually starts a reading (review re-review N1).
+    use std::sync::{Arc, Mutex};
+
+    use murmduck::session::SessionControl;
+    use murmduck::session::SessionState;
+    use murmduck::session::ipc::ControlServer;
+    use murmduck::session::lock::InstanceLock;
+    use murmduck::session::paths::RuntimePaths;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = dir.path().join("murmduck");
+    std::fs::create_dir(&config_dir).expect("create config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[tts]\napi_key_env = \"MURMDUCK_TEST_UNSET_KEY_7C2E\"\n",
+    )
+    .expect("write config");
+
+    let runtime = RuntimePaths::new(dir.path().join("runtime").join("murmduck"));
+    let guard = InstanceLock::try_acquire(&runtime.lock)
+        .expect("acquire lock")
+        .expect("become fake owner");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&runtime.socket).expect("bind control socket");
+    let control = SessionControl::new();
+    let mut server = ControlServer::spawn_with_control(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        control.clone(),
+    );
+
+    // `run_isolated` gives the child a private config/runtime dir and an empty
+    // PATH; the configured API-key variable is deliberately never set.
+    let output = run_isolated(&["toggle"], dir.path(), std::time::Duration::from_secs(3));
+
+    assert!(
+        output.status.success(),
+        "toggle must reach the owner without credentials; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Stopping"),
+        "the owner must be told to stop: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        control.stop_requested(),
+        "the fake owner must have received Stop"
+    );
+
+    server.shutdown();
+    drop(guard);
+}
+
+#[test]
+fn stop_and_status_bypass_an_invalid_config_while_an_owner_is_active() {
+    // Control-only commands need only XDG_RUNTIME_DIR and the socket. An
+    // invalid TOML edit during playback must not block stopping the owner
+    // (review re-review N4).
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use murmduck::session::SessionState;
+    use murmduck::session::lock::InstanceLock;
+    use murmduck::session::paths::RuntimePaths;
+    use murmduck::session::protocol::{self, Response};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = dir.path().join("murmduck");
+    std::fs::create_dir(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("config.toml"), "[tts]\nspeed = 0.0\n")
+        .expect("write deliberately invalid config");
+
+    let runtime = RuntimePaths::new(dir.path().join("runtime").join("murmduck"));
+    let guard = InstanceLock::try_acquire(&runtime.lock)
+        .expect("acquire lock")
+        .expect("become fake owner");
+    let listener = UnixListener::bind(&runtime.socket).expect("bind control socket");
+    let owner = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept command");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).expect("read command");
+            let frame = protocol::encode_response(Response::Ok {
+                state: SessionState::Stopping,
+            });
+            stream.write_all(frame.as_bytes()).expect("write response");
+        }
+        drop(guard);
+    });
+
+    let timeout = std::time::Duration::from_secs(3);
+    let stop = run_isolated(&["stop"], dir.path(), timeout);
+    assert!(
+        stop.status.success(),
+        "stop must bypass config parsing; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stdout).contains("Stopping"),
+        "stop must reach the owner: {}",
+        String::from_utf8_lossy(&stop.stdout)
+    );
+
+    let status = run_isolated(&["status"], dir.path(), timeout);
+    assert!(
+        status.status.success(),
+        "status must bypass config parsing; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("Stopping"),
+        "status must reach the owner: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    owner.join().expect("fake owner joins");
+}
+
+#[test]
 fn a_declined_control_command_makes_the_cli_exit_with_failure() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;

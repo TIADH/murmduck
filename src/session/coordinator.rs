@@ -131,6 +131,25 @@ where
     F: FnMut(ReadingKind) -> B,
     B: SessionBody,
 {
+    let mut fallible = move |kind| -> Result<B, SessionError> { Ok(factory(kind)) };
+    run_with_fallible_factory(paths, command, &mut fallible, retry)
+}
+
+/// Like [`run_with_factory`], but the factory may fail while building a body.
+///
+/// The factory is invoked only after this invocation has won the lock and
+/// become the owner. Owner-only setup — notably TTS credential resolution —
+/// therefore never runs in a control client that just sends Stop or Status.
+pub fn run_with_fallible_factory<F, B>(
+    paths: &RuntimePaths,
+    command: Command,
+    mut factory: F,
+    retry: &ClientRetry,
+) -> Result<CommandOutcome, SessionError>
+where
+    F: FnMut(ReadingKind) -> Result<B, SessionError>,
+    B: SessionBody,
+{
     for attempt in 0..retry.lock_attempts {
         match InstanceLock::try_acquire(&paths.lock)? {
             Some(guard) => return handle_idle(paths, command, guard, &mut factory),
@@ -167,7 +186,7 @@ fn handle_idle<F, B>(
     factory: &mut F,
 ) -> Result<CommandOutcome, SessionError>
 where
-    F: FnMut(ReadingKind) -> B,
+    F: FnMut(ReadingKind) -> Result<B, SessionError>,
     B: SessionBody,
 {
     match command {
@@ -200,7 +219,7 @@ fn become_owner<F, B>(
     initial_kind: ReadingKind,
 ) -> Result<(), SessionError>
 where
-    F: FnMut(ReadingKind) -> B,
+    F: FnMut(ReadingKind) -> Result<B, SessionError>,
     B: SessionBody,
 {
     // Only the lock holder may remove/replace the socket. A stale socket from
@@ -242,7 +261,17 @@ where
             cancel: attempt,
             state: Arc::clone(&state),
         };
-        let mut body = factory(reading_kind);
+        let mut body = match factory(reading_kind) {
+            Ok(body) => body,
+            Err(err) => {
+                // Owner-only setup failed (e.g. missing credentials). Still run
+                // the socket/lock teardown below, then surface the error.
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+                break;
+            }
+        };
         let result = body.run(&context);
         let failed = result.is_err();
         if first_error.is_none() {

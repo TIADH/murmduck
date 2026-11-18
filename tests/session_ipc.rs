@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -201,6 +202,76 @@ fn a_client_that_never_completes_a_frame_does_not_delay_a_stop_command() {
         "the delayed Stop must reach the owner"
     );
     drop(stalled);
+    server.shutdown();
+}
+
+#[test]
+fn a_stop_is_handled_promptly_when_all_worker_slots_hold_trickling_frames() {
+    // Fill every worker slot with a partial frame that trickles a byte often
+    // enough to beat any per-read inactivity timeout. The next real Stop must
+    // still be served immediately: neither a busy worker pool nor a slow client
+    // may hold up the hotkey command.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+    let cancel = Cancellation::new();
+    let mut server = ControlServer::spawn(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        cancel.clone(),
+    );
+
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let mut stream = UnixStream::connect(&socket).expect("connect stalled client");
+        stream
+            .write_all(b"{\"version\":1,\"command\":\"S")
+            .expect("send partial frame");
+        stalled.push(stream);
+    }
+    // Let the accept loop hand every connection to a worker.
+    thread::sleep(Duration::from_millis(150));
+
+    let keep_trickling = Arc::new(AtomicBool::new(true));
+    let trickle_flag = Arc::clone(&keep_trickling);
+    let trickle = thread::spawn(move || {
+        while trickle_flag.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(100));
+            for stream in &mut stalled {
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let options = ClientOptions {
+        attempts: 1,
+        backoff: Duration::from_millis(1),
+    };
+    let ack = ipc::send_command(&socket, Command::Stop, &options);
+    let elapsed = started.elapsed();
+    // Always stop the trickle, including on assertion failure, so shutdown can
+    // join the workers instead of hanging until the test process exits.
+    keep_trickling.store(false, Ordering::Release);
+    let _ = trickle.join();
+    let ack = ack.expect("stop delivered despite a saturated worker pool");
+
+    assert!(
+        matches!(ack.response, Response::Ok { .. }),
+        "stop must be acknowledged: {:?}",
+        ack.response
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a saturated worker pool delayed Stop for {elapsed:?}"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "the delayed Stop must reach the owner"
+    );
     server.shutdown();
 }
 

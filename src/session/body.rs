@@ -327,6 +327,29 @@ impl Drop for PipelineWatchdog {
     }
 }
 
+/// Publish `Playing` from a decoded-buffer callback only while this attempt is
+/// still active. Stop cancels the attempt before writing `Stopping`, so checking
+/// the token and the current state under one lock closes the window in which a
+/// queued first buffer could revert a stopping session (review re-review N3).
+/// Returns `true` when the transition was published.
+fn publish_playing_if_active(
+    state: &Arc<Mutex<SessionState>>,
+    cancel: &Cancellation,
+    report: &Option<Arc<Mutex<SessionReport>>>,
+) -> bool {
+    let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+    if cancel.is_cancelled() || matches!(*guard, SessionState::Stopping | SessionState::Inactive) {
+        return false;
+    }
+    *guard = SessionState::Playing;
+    if let Some(report) = report
+        && let Ok(mut guard) = report.lock()
+    {
+        guard.states.push(SessionState::Playing);
+    }
+    true
+}
+
 /// Bridges the TTS client's streaming `Write` sink to the audio player.
 ///
 /// Each HTTP chunk is pushed straight into `appsrc`; the first decoded buffer
@@ -492,18 +515,12 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
             let state = Arc::clone(&ctx.state);
             let report = self.report.clone();
             let playing_flag = Arc::clone(&playing);
+            let attempt_cancel = ctx.cancel.clone();
             player.on_started(move || {
                 if playing_flag.swap(true, Ordering::AcqRel) {
                     return; // already published
                 }
-                if let Ok(mut guard) = state.lock() {
-                    *guard = SessionState::Playing;
-                }
-                if let Some(report) = &report
-                    && let Ok(mut guard) = report.lock()
-                {
-                    guard.states.push(SessionState::Playing);
-                }
+                publish_playing_if_active(&state, &attempt_cancel, &report);
             });
         }
 
@@ -642,6 +659,88 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// The decoded-buffer probe can fire *after* Stop has cancelled the attempt
+    /// and published `Stopping`. A late callback must not move the shared state
+    /// backwards to `Playing`.
+    #[test]
+    fn a_queued_started_callback_cannot_revert_a_stopping_session() {
+        let state = Arc::new(Mutex::new(SessionState::Playing));
+        let report = Arc::new(Mutex::new(SessionReport::default()));
+        let cancel = Cancellation::new();
+        let report_ref = Some(Arc::clone(&report));
+
+        // First decoded buffer: Playing is published once, as normal.
+        assert!(publish_playing_if_active(&state, &cancel, &report_ref));
+
+        // Stop cancels the attempt, then publishes Stopping.
+        cancel.cancel();
+        *state.lock().expect("state lock") = SessionState::Stopping;
+
+        // A decoded buffer that was queued before Stop now reaches the probe.
+        assert!(
+            !publish_playing_if_active(&state, &cancel, &report_ref),
+            "a post-Stop callback must be rejected"
+        );
+        assert_eq!(
+            *state.lock().expect("state lock"),
+            SessionState::Stopping,
+            "state must never move backwards to Playing"
+        );
+        let states = &report.lock().expect("report lock").states;
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| **state == SessionState::Playing)
+                .count(),
+            1,
+            "the late callback must not publish Playing twice: {states:?}"
+        );
+    }
+
+    /// Cancellation is signalled before the state write by IPC Stop. Even in
+    /// that narrow window, where the state still reads `Buffering`, the probe
+    /// must decline because the attempt token is already cancelled.
+    #[test]
+    fn a_started_callback_in_the_stop_window_cannot_publish_playing() {
+        let state = Arc::new(Mutex::new(SessionState::Buffering));
+        let cancel = Cancellation::new();
+        cancel.cancel();
+
+        assert!(!publish_playing_if_active(&state, &cancel, &None));
+        assert_eq!(*state.lock().expect("state lock"), SessionState::Buffering);
+    }
+
+    /// Deterministic race: whichever thread wins, once Stop has been observed
+    /// the callback cannot resurrect an active state.
+    #[test]
+    fn stop_and_started_callback_race_never_moves_state_backwards() {
+        for _ in 0..100 {
+            let state = Arc::new(Mutex::new(SessionState::Playing));
+            let cancel = Cancellation::new();
+            let (stopped_tx, stopped_rx) = mpsc::channel();
+
+            let stop_state = Arc::clone(&state);
+            let stop_cancel = cancel.clone();
+            let stopper = thread::spawn(move || {
+                stop_cancel.cancel();
+                *stop_state.lock().expect("state lock") = SessionState::Stopping;
+                stopped_tx.send(()).expect("announce stop");
+            });
+            stopped_rx.recv().expect("stop completed first");
+
+            let callback_state = Arc::clone(&state);
+            let callback_cancel = cancel.clone();
+            let callback = thread::spawn(move || {
+                publish_playing_if_active(&callback_state, &callback_cancel, &None)
+            });
+            assert!(!callback.join().expect("callback joins"));
+            stopper.join().expect("stopper joins");
+            assert_eq!(*state.lock().expect("state lock"), SessionState::Stopping);
+        }
+    }
 
     /// Records the *actual* teardown actions, not just their log entries, so a
     /// reordering or a repeated teardown fails the test (spec §6/§10).

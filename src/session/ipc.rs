@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::SessionState;
 use super::body::Cancellation;
@@ -20,14 +20,20 @@ use super::routing;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Client-side I/O budget while waiting for the owner's acknowledgement.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-/// Server-side frame budget. Shorter than the client's so shutdown can join a
-/// stalled worker promptly; a local control frame is only a few dozen bytes.
-const FRAME_TIMEOUT: Duration = Duration::from_millis(750);
+/// Absolute deadline for one server-side frame, measured from connection time.
+/// A per-read inactivity timeout is not enough: a client that trickles a byte
+/// every few milliseconds could otherwise hold a worker indefinitely.
+const FRAME_DEADLINE: Duration = Duration::from_millis(750);
+/// A complete local control frame is only a few dozen bytes. When every worker
+/// is busy, the accept loop spends at most this long collecting such a frame
+/// before rejecting the connection.
+const PRIORITY_WAIT: Duration = Duration::from_millis(20);
 /// Maximum bytes in one newline-delimited control frame. A client that sends
 /// more (without a newline) is dropped rather than allowed to grow memory.
 const MAX_FRAME_BYTES: usize = 4096;
-/// Upper bound on concurrently served clients. The accept loop never performs
-/// framing itself, so a slow client cannot delay new connections.
+/// Upper bound on concurrently served clients. A slow client cannot hold up new
+/// connections: excess connections are served inline (complete frames) or
+/// rejected immediately (partial frames).
 const MAX_WORKERS: usize = 8;
 
 /// Retry policy for a control client.
@@ -158,20 +164,26 @@ fn serve(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
-                // Framing (which may block on a slow client) happens on a
-                // worker, never on the accept loop. Bound the worker count so a
-                // flood of connections cannot spawn unbounded threads.
-                loop {
-                    if let Ok(mut active) = workers.lock() {
+                // Framing (which may block on a slow client) normally happens
+                // on a worker, never on the accept loop. Bound the worker count
+                // so a flood of connections cannot spawn unbounded threads.
+                let free_slot = match workers.lock() {
+                    Ok(mut active) => {
                         active.retain(|handle| !handle.is_finished());
-                        if active.len() < MAX_WORKERS {
-                            break;
-                        }
+                        active.len() < MAX_WORKERS
                     }
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
+                    Err(err) => {
+                        err.into_inner().retain(|handle| !handle.is_finished());
+                        false
                     }
-                    thread::sleep(POLL_INTERVAL);
+                };
+                if !free_slot {
+                    // Never wait for a busy worker to free up: a trickling
+                    // client could hold every slot far past any read timeout,
+                    // delaying the real Stop command. Serve a complete local
+                    // command right here and reject an incomplete one quickly.
+                    handle_priority_connection(stream, &state, &control);
+                    continue;
                 }
                 let worker_state = Arc::clone(&state);
                 let worker_control = control.clone();
@@ -195,42 +207,92 @@ fn serve(
     }
 }
 
-fn handle_connection(
-    stream: UnixStream,
+/// Serve a frame when all workers are occupied. Legitimate local clients write
+/// their whole frame in one go, so this is fast; an incomplete frame is dropped
+/// instead of monopolising a slot or the accept loop.
+fn handle_priority_connection(
+    mut stream: UnixStream,
     state: &Arc<Mutex<SessionState>>,
     control: &SessionControl,
 ) {
-    let _ = stream.set_read_timeout(Some(FRAME_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(FRAME_TIMEOUT));
-
-    let mut reader = match stream.try_clone() {
-        Ok(clone) => BufReader::new(clone),
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot clone control stream");
-            return;
-        }
-    };
-    let mut writer = stream;
-
-    // Read at most one byte beyond the cap: a frame that long without a
-    // newline is oversized and the client is dropped instead of allocating.
+    let deadline = Instant::now() + PRIORITY_WAIT;
     let mut line = Vec::new();
-    let read = (&mut reader)
-        .take((MAX_FRAME_BYTES + 1) as u64)
-        .read_until(b'\n', &mut line);
-    match read {
-        Ok(_) if line.len() <= MAX_FRAME_BYTES => {}
-        Ok(_) => {
-            tracing::warn!(bytes = line.len(), "oversized control frame dropped");
+    let mut buf = [0u8; 512];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return;
         }
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot read control command");
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                line.extend_from_slice(&buf[..n]);
+                if line.len() > MAX_FRAME_BYTES || line.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    if !line.contains(&b'\n') || line.len() > MAX_FRAME_BYTES {
+        tracing::warn!("incomplete control frame rejected while workers are busy");
+        return;
+    }
+    write_response(&mut stream, dispatch_frame(&line, state, control));
+}
+
+fn handle_connection(
+    mut stream: UnixStream,
+    state: &Arc<Mutex<SessionState>>,
+    control: &SessionControl,
+) {
+    // An absolute deadline, refreshed only as a remaining budget for each read,
+    // bounds a client even when it keeps trickling bytes that reset a plain
+    // inactivity timeout.
+    let deadline = Instant::now() + FRAME_DEADLINE;
+    let mut line = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("control frame deadline exceeded; dropping client");
             return;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // Read at most one byte beyond the cap: a longer frame without
+                // a newline is oversized and dropped instead of allocating.
+                line.extend_from_slice(&buf[..n]);
+                if line.len() > MAX_FRAME_BYTES {
+                    tracing::warn!(bytes = line.len(), "oversized control frame dropped");
+                    return;
+                }
+                if line.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read control command");
+                return;
+            }
         }
     }
 
-    let response = match protocol::decode_command(&line) {
+    write_response(&mut stream, dispatch_frame(&line, state, control));
+}
+
+/// Decode one complete frame and apply it to the shared session state. Shared
+/// by worker connections and the at-capacity priority path so both behave
+/// identically.
+fn dispatch_frame(
+    line: &[u8],
+    state: &Arc<Mutex<SessionState>>,
+    control: &SessionControl,
+) -> Response {
+    match protocol::decode_command(line) {
         Ok(envelope) => match routing::replacement_kind(envelope.command) {
             Some(kind) => {
                 // Interrupt the current reading immediately; the owner loop
@@ -268,12 +330,15 @@ fn handle_connection(
         Err(err) => Response::Error {
             message: err.to_string(),
         },
-    };
+    }
+}
 
+fn write_response(stream: &mut UnixStream, response: Response) {
     let frame = protocol::encode_response(response);
-    if let Err(err) = writer
+    let _ = stream.set_write_timeout(Some(FRAME_DEADLINE));
+    if let Err(err) = stream
         .write_all(frame.as_bytes())
-        .and_then(|_| writer.flush())
+        .and_then(|_| stream.flush())
     {
         tracing::warn!(error = %err, "cannot write control response");
     }

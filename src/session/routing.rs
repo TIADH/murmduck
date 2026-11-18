@@ -41,11 +41,3 @@ pub fn replacement_kind(command: WireCommand) -> Option<ReadingKind> {
         WireCommand::Stop | WireCommand::Status => None,
     }
 }
-
-/// Whether this command can produce audio and therefore needs a session owner.
-pub fn starts_session(command: Command) -> bool {
-    matches!(
-        command,
-        Command::Toggle | Command::ReadSelection | Command::TestVoice
-    )
-}

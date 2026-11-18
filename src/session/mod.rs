@@ -10,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioError;
+use crate::config::ConfigError;
 use crate::selection::SelectionError;
 use crate::tts::TtsError;
 
@@ -29,6 +30,8 @@ pub use control::{ReadingKind, SessionControl};
 pub enum SessionError {
     /// The XDG runtime directory could not be determined.
     Runtime { detail: String },
+    /// Owner-only setup (for example credential resolution) failed.
+    Config(ConfigError),
     /// The instance lock could not be acquired or prepared.
     Lock(lock::LockError),
     /// A socket or filesystem operation failed.
@@ -53,6 +56,7 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime { detail } => write!(f, "session runtime error: {detail}"),
+            Self::Config(err) => write!(f, "{err}"),
             Self::Lock(err) => write!(f, "{err}"),
             Self::Io { detail } => write!(f, "session I/O error: {detail}"),
             Self::Protocol(err) => write!(f, "{err}"),
@@ -71,6 +75,12 @@ impl Error for SessionError {}
 impl From<lock::LockError> for SessionError {
     fn from(err: lock::LockError) -> Self {
         Self::Lock(err)
+    }
+}
+
+impl From<ConfigError> for SessionError {
+    fn from(err: ConfigError) -> Self {
+        Self::Config(err)
     }
 }
 

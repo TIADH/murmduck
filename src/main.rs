@@ -5,11 +5,11 @@ use murmduck::audio::{AudioSink, StreamConfig};
 use murmduck::cli::{Cli, Command};
 use murmduck::selection::{self, SelectionSource, StaticSource, WaylandPrimary};
 use murmduck::session::body::{NoopBody, ReadAloudSession, SessionBody, SessionContext};
-use murmduck::session::coordinator::{self, ClientRetry};
+use murmduck::session::coordinator::{self, ClientRetry, CommandOutcome};
 use murmduck::session::paths::RuntimePaths;
-use murmduck::session::routing;
 use murmduck::session::{ReadingKind, SessionError, TeardownStep};
 use murmduck::{config, logging};
+use tracing::level_filters::LevelFilter;
 
 /// Concrete bodies the real CLI can run. `read-selection`/`toggle` read the
 /// PRIMARY selection; `test-voice` uses the fixed sample. A replacement picks
@@ -55,23 +55,35 @@ fn make_body<S: SelectionSource>(
 }
 
 /// Build a fresh reading for each attempt the session owner runs.
+///
+/// The coordinator calls the factory only after this invocation has acquired
+/// the instance lock, so credentials are resolved once per owner — never by a
+/// control client that merely forwards Stop or Status over IPC.
 fn reading_factory(
     config: &config::Config,
-    api_key: Option<String>,
-) -> impl FnMut(ReadingKind) -> AppBody {
+) -> impl FnMut(ReadingKind) -> Result<AppBody, SessionError> {
     let config = config.clone();
-    move |kind| match kind {
-        ReadingKind::Selection => AppBody::Selection(make_body(
-            &config,
-            api_key.clone(),
-            WaylandPrimary::new(config.selection.timeout())
-                .with_max_chars(config.selection.max_chars),
-        )),
-        ReadingKind::TestVoice => AppBody::TestVoice(make_body(
-            &config,
-            api_key.clone(),
-            StaticSource::new(selection::TEST_VOICE_SAMPLE),
-        )),
+    let mut api_key: Option<Option<String>> = None;
+    move |kind| {
+        if api_key.is_none() {
+            let resolved = config.tts.resolve_api_key()?;
+            logging::log_startup(&config, env!("CARGO_PKG_VERSION"), resolved.as_deref());
+            api_key = Some(resolved);
+        }
+        let key = api_key.clone().flatten();
+        Ok(match kind {
+            ReadingKind::Selection => AppBody::Selection(make_body(
+                &config,
+                key,
+                WaylandPrimary::new(config.selection.timeout())
+                    .with_max_chars(config.selection.max_chars),
+            )),
+            ReadingKind::TestVoice => AppBody::TestVoice(make_body(
+                &config,
+                key,
+                StaticSource::new(selection::TEST_VOICE_SAMPLE),
+            )),
+        })
     }
 }
 
@@ -87,63 +99,55 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Configuration is located, loaded and validated before any selection,
-    // network or audio work begins.
+    match cli.command {
+        // Control-only commands need the runtime dir/socket and nothing else.
+        // They must keep working when the TOML config has been edited into an
+        // invalid state during playback (review re-review N4).
+        Command::Stop | Command::Status { .. } => run_control(cli.command),
+        // Commands that can produce audio load and validate config on every
+        // invocation; an invocation that becomes a control client still avoids
+        // credential resolution because the reading factory is owner-only.
+        Command::Toggle | Command::ReadSelection | Command::TestVoice => run_owner(cli.command),
+    }
+}
+
+/// Minimal path for commands that only talk to a live owner. No config file is
+/// located or parsed and no credentials are resolved.
+fn run_control(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    logging::init(LevelFilter::INFO)?;
+    let runtime = RuntimePaths::from_env()?;
+    let retry = ClientRetry::default();
+    let outcome = coordinator::run(&runtime, command, NoopBody, &retry)?;
+    print_outcome(command, outcome);
+    Ok(())
+}
+
+/// Full path for an invocation that may become the session owner.
+fn run_owner(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     let path = config::config_path()?;
     let config = config::Config::load(&path)?;
     let level = config.logging.level_filter()?;
-
     logging::init(level)?;
     tracing::debug!(path = %path.display(), "configuration loaded");
 
-    // Credentials are only resolved by an invocation that will START a reading.
-    // `stop` and `status` talk to an existing owner and never contact TTS, so a
-    // missing `api_key_env` variable must not prevent them from working.
-    let api_key = if routing::starts_session(cli.command) {
-        config.tts.resolve_api_key()?
-    } else {
-        None
-    };
-    logging::log_startup(&config, env!("CARGO_PKG_VERSION"), api_key.as_deref());
-
-    dispatch(&config, cli.command, api_key)
-}
-
-/// Route a parsed command through the session coordinator.
-///
-/// Every command that can produce audio becomes an owner when idle and a
-/// control client when a session is active. `toggle`/`stop` request a stop;
-/// `read-selection`/`test-voice` request replacement with a fresh reading.
-fn dispatch(
-    config: &config::Config,
-    command: Command,
-    api_key: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RuntimePaths::from_env()?;
     let retry = ClientRetry::default();
-
-    let outcome = if routing::starts_session(command) {
-        let factory = reading_factory(config, api_key);
-        coordinator::run_with_factory(&runtime, command, factory, &retry)?
-    } else {
-        match command {
-            Command::Stop => coordinator::run(&runtime, Command::Stop, NoopBody, &retry)?,
-            Command::Status { json } => {
-                let outcome =
-                    coordinator::run(&runtime, Command::Status { json }, NoopBody, &retry)?;
-                if json {
-                    println!("{}", outcome.report_json());
-                } else {
-                    println!("{}", outcome.report());
-                }
-                return Ok(());
-            }
-            // `starts_session` covers the three audio-producing commands.
-            Command::Toggle | Command::ReadSelection | Command::TestVoice => unreachable!(),
-        }
-    };
-    println!("{}", outcome.report());
+    let outcome = coordinator::run_with_fallible_factory(
+        &runtime,
+        command,
+        reading_factory(&config),
+        &retry,
+    )?;
+    print_outcome(command, outcome);
     Ok(())
+}
+
+fn print_outcome(command: Command, outcome: CommandOutcome) {
+    if matches!(command, Command::Status { json: true }) {
+        println!("{}", outcome.report_json());
+    } else {
+        println!("{}", outcome.report());
+    }
 }
 
 #[cfg(test)]
