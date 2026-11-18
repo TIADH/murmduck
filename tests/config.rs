@@ -64,6 +64,16 @@ fn partial_config_fills_omitted_keys_with_defaults() {
 }
 
 #[test]
+fn wav_response_format_is_accepted() {
+    let (_dir, path) = config_in("[tts]\nresponse_format = \"wav\"\n");
+
+    let config = Config::load(&path).expect("wav is a supported response format");
+
+    assert_eq!(config.tts.response_format, ResponseFormat::Wav);
+    assert_eq!(config.tts.base_url, "http://localhost:8880/v1");
+}
+
+#[test]
 fn fully_specified_config_is_loaded() {
     let (_dir, path) = config_in(
         r#"
@@ -109,7 +119,7 @@ fn invalid_values_produce_actionable_errors() {
     assert_rejected("[tts]\nbase_url = \"localhost:1234\"\n", "tts.base_url");
     assert_rejected("[tts]\nmodel = \"\"\n", "tts.model");
     assert_rejected("[tts]\nvoice = \"\"\n", "tts.voice");
-    assert_rejected("[tts]\nresponse_format = \"wav\"\n", "response_format");
+    assert_rejected("[tts]\nresponse_format = \"flac\"\n", "response_format");
     assert_rejected("[audio]\nvolume = 1.5\n", "audio.volume");
     assert_rejected("[selection]\nmax_chars = 0\n", "selection.max_chars");
     assert_rejected("[selection]\ntimeout_ms = 0\n", "selection.timeout_ms");

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use murmduck::audio::{AudioSink, StreamConfig};
 use murmduck::cli::Command;
-use murmduck::config::{SelectionConfig, TtsConfig};
+use murmduck::config::{ResponseFormat, SelectionConfig, TtsConfig};
 use murmduck::selection::{SelectionError, SelectionSource};
 use murmduck::session::body::{
     Cancellation, NoopBody, ReadAloudSession, SessionBody, SessionContext, SessionReport,
@@ -24,21 +24,13 @@ use murmduck::session::paths::RuntimePaths;
 use murmduck::session::{SessionError, SessionState};
 use murmduck::tts::TtsError;
 
+mod common;
+use common::{wav_stream, wait_for};
+
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tone.mp3");
 
 fn fixture() -> Vec<u8> {
     std::fs::read(FIXTURE).expect("read MP3 fixture")
-}
-
-fn wait_until(condition: impl Fn() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    condition()
 }
 
 struct FakeSource {
@@ -318,6 +310,43 @@ fn retry() -> Retry {
 }
 
 #[test]
+fn wav_response_format_reaches_both_the_tts_request_and_the_audio_pipeline() {
+    let bytes = wav_stream(1, 48_000, 24_000);
+    let midpoint = bytes.len() / 2;
+    let server = FakeTtsServer::spawn(ServerConfig::ok(vec![
+        bytes[..midpoint].to_vec(),
+        bytes[midpoint..].to_vec(),
+    ]));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runtime = paths(&dir);
+    let report = Arc::new(Mutex::new(SessionReport::default()));
+    let config = TtsConfig {
+        response_format: ResponseFormat::Wav,
+        ..tts_config(&server)
+    };
+    let body = ReadAloudSession::new(
+        FakeSource::new("WAV selection."),
+        SelectionConfig::default(),
+        config,
+        None,
+        AudioSink::Fake,
+    )
+    .with_report(Arc::clone(&report));
+
+    let outcome = coordinator::run(&runtime, Command::Toggle, body, &retry())
+        .expect("a WAV session completes");
+    assert!(matches!(outcome, CommandOutcome::SessionRan), "{outcome:?}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "exactly one TTS request");
+    assert_eq!(requests[0].body["response_format"], "wav");
+
+    let report = report.lock().expect("report lock");
+    assert_eq!(report.bytes_pushed, bytes.len() as u64);
+    assert!(report.decoded_bytes > 0, "WAV audio must reach the sink");
+}
+
+#[test]
 fn toggle_streams_the_selection_to_tts_and_plays_it_to_completion() {
     let bytes = fixture();
     let midpoint = bytes.len() / 2;
@@ -410,7 +439,7 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
     };
 
     let owner = thread::spawn(move || body.run(&ctx));
-    let started = wait_until(
+    let started = wait_for(
         || *state.lock().expect("state lock") == SessionState::Playing,
         Duration::from_secs(5),
     );
@@ -451,7 +480,7 @@ fn a_short_first_http_chunk_does_not_stall_first_audio_by_a_second() {
     let started = Instant::now();
     let owner = thread::spawn(move || body.run(&ctx));
     assert!(
-        wait_until(
+        wait_for(
             || *state.lock().expect("state lock") == SessionState::Playing,
             Duration::from_secs(5)
         ),
@@ -498,7 +527,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
         thread::spawn(move || coordinator::run(&runtime, Command::Toggle, body, &retry()))
     };
 
-    let observed = wait_until(
+    let observed = wait_for(
         || {
             let paths = runtime.clone();
             match coordinator::run(&paths, Command::Status { json: false }, NoopBody, &retry()) {

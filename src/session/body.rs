@@ -501,9 +501,15 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
         // Cancellation can arrive while Connecting is published or while the
         // pipeline is being constructed; either way the pipeline is torn down
         // through the same ordered path as a cancellation during streaming.
+        // The configured response format selects the decoder path: a WAV
+        // response cannot be framed by the MP3 pipeline, and vice versa.
         let player = Arc::new(
-            StreamingMp3Player::new(self.sink.clone(), self.stream_config)
-                .map_err(SessionError::Audio)?,
+            StreamingMp3Player::with_format(
+                self.sink.clone(),
+                self.stream_config,
+                self.tts_config.response_format.into(),
+            )
+            .map_err(SessionError::Audio)?,
         );
         observer.player_opened();
 

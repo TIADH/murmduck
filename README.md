@@ -81,7 +81,7 @@ api_key_env = "MURMDUCK_API_KEY"   # omit this key for servers without auth
 model = "tts-1"
 voice = "alloy"
 speed = 1.0
-response_format = "mp3"
+response_format = "mp3"   # "mp3" (default) or "wav"
 
 [audio]
 volume = 1.0
@@ -94,6 +94,11 @@ timeout_ms = 2000
 [logging]
 level = "info"
 ```
+
+`response_format` selects what the server produces. Streaming WAV is supported
+for OpenAI-compatible servers that only emit WAV (for example VieNeu-TTS),
+including responses whose RIFF/data lengths are placeholders; playback still
+starts before synthesis finishes.
 
 If your server needs an API key, put the **value** in an environment variable
 named by `api_key_env`, and make sure that variable is present in the
