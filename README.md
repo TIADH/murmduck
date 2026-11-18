@@ -1,0 +1,127 @@
+# Murmduck
+
+On-demand, streaming text-to-speech for Linux. Select text in an application,
+press a global KDE shortcut, and Murmduck reads the PRIMARY selection aloud
+using an OpenAI-compatible TTS server. Press the shortcut again to stop.
+
+Murmduck is a single CLI executable. There is no daemon, no systemd service and
+no GUI. Each invocation either becomes the one session owner or sends a control
+command to it; it exits as soon as playback finishes or is cancelled.
+
+Target platform for the MVP: **Fedora, KDE Plasma, Wayland, x86_64**.
+
+## How it works
+
+1. KDE runs `murmduck toggle` when the global shortcut is pressed.
+2. With no active session, Murmduck reads the PRIMARY selection via
+   `wl-paste --primary --no-newline`, validates it, and streams it to
+   `POST {base_url}/audio/speech`.
+3. MP3 bytes are fed incrementally into a bounded GStreamer `appsrc` pipeline;
+   playback starts before the whole HTTP response has arrived.
+4. A second `toggle` (or `stop`) reaches the owner over a temporary Unix
+   socket and cancels the request, the pipeline and the selection subprocess
+   in a fixed order, then releases the lock and exits.
+
+Audio backend decision: [`docs/adr/0001-gstreamer-streaming-audio-backend.md`](docs/adr/0001-gstreamer-streaming-audio-backend.md).
+
+## Requirements
+
+- Fedora KDE Plasma Wayland (x86_64).
+- `wl-clipboard` (`wl-paste`) for the PRIMARY selection.
+- GStreamer with an MP3 decoder (`mpg123audiodec`) and an audio sink plugin.
+- A reachable OpenAI-compatible streaming TTS server that returns `audio/mpeg`
+  (MP3). Authentication is optional.
+
+## Install
+
+### From RPM
+
+Build the package as described in [`docs/installation.md`](docs/installation.md#install-from-rpm),
+then:
+
+```bash
+sudo dnf install ./murmduck-0.1.0-1.*.x86_64.rpm
+```
+
+The RPM installs `/usr/bin/murmduck` and documentation under
+`/usr/share/doc/murmduck/`.
+
+### From source
+
+```bash
+sudo dnf install rust cargo gstreamer1-devel gstreamer1-plugins-base-devel pkgconf-pkg-config
+cargo build --release --locked
+install -Dm755 target/release/murmduck ~/.local/bin/murmduck
+```
+
+## Configure
+
+Create `~/.config/murmduck/config.toml` (or
+`$XDG_CONFIG_HOME/murmduck/config.toml`). A missing file uses documented
+defaults, but a TTS server must be reachable:
+
+```toml
+[tts]
+base_url = "http://localhost:8880/v1"
+api_key_env = "MURMDUCK_API_KEY"   # omit this key for servers without auth
+model = "tts-1"
+voice = "alloy"
+speed = 1.0
+response_format = "mp3"
+
+[audio]
+volume = 1.0
+
+[selection]
+provider = "wayland-primary"
+max_chars = 20000
+timeout_ms = 2000
+
+[logging]
+level = "info"
+```
+
+If your server needs an API key, put the **value** in an environment variable
+named by `api_key_env`, and make sure that variable is present in the
+graphical session (not only in an interactive shell). See
+[`docs/installation.md#api-credentials-in-the-graphical-session`](docs/installation.md#api-credentials-in-the-graphical-session).
+
+Selected text and API keys are never written to logs; only sizes and a
+`<redacted>` marker are logged.
+
+## KDE global shortcut
+
+In KDE System Settings → **Shortcuts → Custom Shortcuts**:
+
+1. **Edit → New → Global Shortcut → Command or URL**.
+2. Name it, e.g. *Murmduck: read / stop selection*.
+3. Set the trigger to your preferred combination (for example `Ctrl+Alt+R`).
+4. Set **Command URL** to the absolute path
+   `/usr/bin/murmduck toggle` (or the absolute path to your source install).
+5. Apply, then select text in a supported application and press the shortcut.
+   Press it again to stop playback.
+
+An absolute path is recommended because KDE does not necessarily launch commands
+with the `PATH` of an interactive shell. Full details, including how to run
+without a terminal and how focus is preserved, are in
+[`docs/installation.md#kde-plasma-custom-shortcut`](docs/installation.md#kde-plasma-custom-shortcut).
+
+## Commands
+
+| Command | Behavior |
+| --- | --- |
+| `murmduck toggle` | Start reading the selection, or stop the active session. |
+| `murmduck read-selection` | Read the selection; replace an active reading. |
+| `murmduck stop` | Stop the active session (no-op when idle). |
+| `murmduck status` / `status --json` | Report session state. |
+| `murmduck test-voice` | Play a short sample with the configured voice. |
+| `murmduck --version` / `--help` | Version and help. |
+
+## Verification
+
+`docs/acceptance-report.md` records what is verified automatically here and
+which criteria require the Fedora KDE Wayland target.
+
+## License
+
+Dual-licensed under MIT OR Apache-2.0. See [`LICENSE`](LICENSE).
