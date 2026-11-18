@@ -61,7 +61,7 @@ fn a_status_command_reports_the_owners_current_state() {
 }
 
 #[test]
-fn replace_selection_is_acknowledged_without_stopping_the_owner() {
+fn replace_selection_cancels_the_current_reading_and_reports_stopping() {
     let dir = tempfile::tempdir().expect("temp dir");
     let socket = dir.path().join("control.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
@@ -75,13 +75,52 @@ fn replace_selection_is_acknowledged_without_stopping_the_owner() {
 
     let ack = ipc::send_command(&socket, Command::ReplaceSelection, &fast_options())
         .expect("client delivers");
-    assert!(matches!(ack.response, Response::Ok { .. }));
+    assert_eq!(
+        ack.response,
+        Response::Ok {
+            state: SessionState::Stopping
+        }
+    );
     assert!(
-        !cancel.is_cancelled(),
-        "replacement must not stop the owner in this milestone"
+        cancel.is_cancelled(),
+        "replacement stops the current reading before the new one starts"
     );
 
     server.shutdown();
+}
+
+#[test]
+fn replace_test_voice_is_routed_without_stopping_the_session_lock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+    let cancel = Cancellation::new();
+    let control = murmduck::session::SessionControl::new();
+    let mut server = ControlServer::spawn_with_control(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        control.clone(),
+    );
+
+    let ack = ipc::send_command(&socket, Command::ReplaceTestVoice, &fast_options())
+        .expect("client delivers");
+    assert!(matches!(ack.response, Response::Ok { .. }));
+    assert_eq!(
+        control.replacement_kind(),
+        murmduck::session::ReadingKind::TestVoice
+    );
+    assert!(
+        control.replace_requested(),
+        "a replacement must be visible to the owner loop"
+    );
+    assert!(
+        !control.stop_requested(),
+        "replacement keeps the owner alive; only Stop ends the session"
+    );
+
+    server.shutdown();
+    assert!(!cancel.is_cancelled(), "the legacy handle is untouched");
 }
 
 #[test]

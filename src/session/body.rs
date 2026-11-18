@@ -55,6 +55,18 @@ pub trait SessionBody: Send {
     fn record_teardown(&self, _step: TeardownStep) {}
 }
 
+/// Boxed bodies remain bodies, so the one-body coordinator wrapper can reuse
+/// the same factory seam as the replacement-aware loop.
+impl<T: SessionBody + ?Sized> SessionBody for Box<T> {
+    fn run(&mut self, ctx: &SessionContext) -> Result<(), SessionError> {
+        (**self).run(ctx)
+    }
+
+    fn record_teardown(&self, step: TeardownStep) {
+        (**self).record_teardown(step);
+    }
+}
+
 /// A body that starts and immediately finishes. Used by commands (`stop`,
 /// `status`) that only become an owner transiently and never run a session.
 pub struct NoopBody;
@@ -247,10 +259,9 @@ impl Write for AudioSinkWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.ctx.cancel.is_cancelled() {
             self.cancelled = true;
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "session cancelled",
-            ));
+            // Must not be `Interrupted`: `Write::write_all` retries that kind
+            // forever while the cancellation flag stays set.
+            return Err(io::Error::other("session cancelled"));
         }
         if let Err(err) = self.player.push(buf) {
             self.audio_error = Some(err);
@@ -271,10 +282,9 @@ impl Write for AudioSinkWriter<'_> {
             }
             if self.ctx.cancel.is_cancelled() {
                 self.cancelled = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "session cancelled",
-                ));
+                // See the note in `write`: an Interrupted error would be retried
+                // by `write_all` for as long as cancellation remains set.
+                return Err(io::Error::other("session cancelled"));
             }
             if self.player.events().contains(&PlayerEvent::Started) {
                 self.playing = true;

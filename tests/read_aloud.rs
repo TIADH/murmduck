@@ -430,7 +430,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
     let observed = wait_until(
         || {
             let paths = runtime.clone();
-            match coordinator::run(&paths, Command::Status, NoopBody, &retry()) {
+            match coordinator::run(&paths, Command::Status { json: false }, NoopBody, &retry()) {
                 Ok(CommandOutcome::Status(state)) => {
                     state == SessionState::Buffering || state == SessionState::Playing
                 }

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::SessionState;
 use super::body::Cancellation;
+use super::control::{ReadingKind, SessionControl};
 use super::protocol::{self, Command, ProtocolError, Response, ResponseEnvelope};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -98,16 +99,26 @@ pub struct ControlServer;
 
 impl ControlServer {
     /// Serve control commands from `listener` until the returned handle is
-    /// shut down. `state` is shared with the body for `Status` replies; `cancel`
-    /// is signalled when a `Stop` command arrives.
+    /// shut down, using `cancel` as the whole session's cancellation. Kept for
+    /// callers with no replacement loop; Stop and replacement both signal it.
     pub fn spawn(
         listener: UnixListener,
         state: Arc<Mutex<SessionState>>,
         cancel: Cancellation,
     ) -> ControlServerHandle {
+        Self::spawn_with_control(listener, state, SessionControl::from_cancel(cancel))
+    }
+
+    /// Serve control commands against a session-level [`SessionControl`].
+    /// `state` is shared with the running body for `Status` replies.
+    pub fn spawn_with_control(
+        listener: UnixListener,
+        state: Arc<Mutex<SessionState>>,
+        control: SessionControl,
+    ) -> ControlServerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let loop_shutdown = shutdown.clone();
-        let thread = thread::spawn(move || serve(listener, state, cancel, loop_shutdown));
+        let thread = thread::spawn(move || serve(listener, state, control, loop_shutdown));
         ControlServerHandle {
             shutdown,
             thread: Some(thread),
@@ -118,7 +129,7 @@ impl ControlServer {
 fn serve(
     listener: UnixListener,
     state: Arc<Mutex<SessionState>>,
-    cancel: Cancellation,
+    control: SessionControl,
     shutdown: Arc<AtomicBool>,
 ) {
     if let Err(err) = listener.set_nonblocking(true) {
@@ -128,7 +139,7 @@ fn serve(
 
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => handle_connection(stream, &state, &cancel),
+            Ok((stream, _)) => handle_connection(stream, &state, &control),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
             Err(err) => {
                 tracing::warn!(error = %err, "control listener stopped accepting");
@@ -138,7 +149,11 @@ fn serve(
     }
 }
 
-fn handle_connection(stream: UnixStream, state: &Arc<Mutex<SessionState>>, cancel: &Cancellation) {
+fn handle_connection(
+    stream: UnixStream,
+    state: &Arc<Mutex<SessionState>>,
+    control: &SessionControl,
+) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
@@ -160,7 +175,21 @@ fn handle_connection(stream: UnixStream, state: &Arc<Mutex<SessionState>>, cance
     let response = match protocol::decode_command(&line) {
         Ok(envelope) => match envelope.command {
             Command::Stop => {
-                cancel.cancel();
+                control.stop();
+                let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+                *guard = SessionState::Stopping;
+                Response::Ok {
+                    state: SessionState::Stopping,
+                }
+            }
+            Command::ReplaceSelection | Command::ReplaceTestVoice => {
+                let kind = match envelope.command {
+                    Command::ReplaceTestVoice => ReadingKind::TestVoice,
+                    _ => ReadingKind::Selection,
+                };
+                // Interrupt the current reading immediately; the owner loop
+                // then starts a fresh one before this socket is closed.
+                control.request_replace(kind);
                 let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
                 *guard = SessionState::Stopping;
                 Response::Ok {
@@ -170,14 +199,6 @@ fn handle_connection(stream: UnixStream, state: &Arc<Mutex<SessionState>>, cance
             Command::Status => Response::Ok {
                 state: *state.lock().unwrap_or_else(|err| err.into_inner()),
             },
-            Command::ReplaceSelection => {
-                // Defined now; replacement behaviour arrives in a later ticket.
-                // It is acknowledged so clients do not block, but never stops
-                // the owner in this milestone.
-                Response::Ok {
-                    state: *state.lock().unwrap_or_else(|err| err.into_inner()),
-                }
-            }
         },
         Err(err) => Response::Error {
             message: err.to_string(),

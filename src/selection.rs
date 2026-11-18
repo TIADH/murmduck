@@ -89,6 +89,31 @@ pub trait SelectionSource {
     }
 }
 
+/// Short predefined text played by `test-voice` (spec §7). Unlike a PRIMARY
+/// selection this is not user data, but it still travels through the same
+/// validated text path and is never included in log messages.
+pub const TEST_VOICE_SAMPLE: &str =
+    "Hello from Murmduck. This is a short test of your configured voice.";
+
+/// A source that always yields fixed text. Used by `test-voice` and as a fake
+/// in tests, so no Wayland display is needed to drive a session.
+#[derive(Debug, Clone)]
+pub struct StaticSource {
+    text: String,
+}
+
+impl StaticSource {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+impl SelectionSource for StaticSource {
+    fn read_text(&self) -> Result<String, SelectionError> {
+        Ok(self.text.clone())
+    }
+}
+
 /// Validated text read from the PRIMARY selection.
 ///
 /// `Debug` is implemented by hand to redact the contents so an accidental

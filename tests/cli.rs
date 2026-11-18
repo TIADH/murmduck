@@ -48,7 +48,7 @@ fn every_documented_command_parses() {
         ("toggle", CliCommand::Toggle),
         ("read-selection", CliCommand::ReadSelection),
         ("stop", CliCommand::Stop),
-        ("status", CliCommand::Status),
+        ("status", CliCommand::Status { json: false }),
         ("test-voice", CliCommand::TestVoice),
     ];
 
@@ -57,6 +57,15 @@ fn every_documented_command_parses() {
             .unwrap_or_else(|err| panic!("{name} should parse: {err}"));
         assert_eq!(cli.command, expected, "wrong command parsed for {name}");
     }
+}
+
+#[test]
+fn status_accepts_an_optional_json_flag() {
+    let cli = Cli::try_parse_from(["murmduck", "status", "--json"]).expect("status --json parses");
+    assert_eq!(cli.command, CliCommand::Status { json: true });
+
+    let cli = Cli::try_parse_from(["murmduck", "status"]).expect("status parses");
+    assert_eq!(cli.command, CliCommand::Status { json: false });
 }
 
 #[test]
@@ -70,11 +79,11 @@ fn read_selection_is_wired_to_the_selection_provider() {
     // because wl-paste is absent; on the Wayland target it reports a count.
     // Either way it must no longer be the placeholder command.
     let dir = tempfile::tempdir().expect("temp dir");
-    let output = murmduck()
-        .arg("read-selection")
-        .env("XDG_CONFIG_HOME", dir.path())
-        .output()
-        .expect("run binary");
+    let output = run_isolated(
+        &["read-selection"],
+        dir.path(),
+        std::time::Duration::from_secs(3),
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -162,6 +171,22 @@ fn stop_and_status_are_noops_when_no_session_is_active() {
         String::from_utf8_lossy(&status.stdout).contains("Inactive"),
         "status should report Inactive: {}",
         String::from_utf8_lossy(&status.stdout)
+    );
+
+    let status_json = run_isolated(&["status", "--json"], dir.path(), timeout);
+    assert!(
+        status_json.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status_json.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status_json.stdout);
+    assert!(
+        stdout.contains("\"state\":\"Inactive\""),
+        "status --json should emit structured state: {stdout:?}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "status --json output must be valid JSON: {stdout:?}"
     );
 }
 

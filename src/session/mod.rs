@@ -14,11 +14,14 @@ use crate::selection::SelectionError;
 use crate::tts::TtsError;
 
 pub mod body;
+pub mod control;
 pub mod coordinator;
 pub mod ipc;
 pub mod lock;
 pub mod paths;
 pub mod protocol;
+
+pub use control::{ReadingKind, SessionControl};
 
 /// Errors raised while coordinating a session or driving its control socket.
 #[derive(Debug)]

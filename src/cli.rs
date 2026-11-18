@@ -28,7 +28,11 @@ pub enum Command {
     Stop,
 
     /// Report the current session status.
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of a human-readable line.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Play a short sample using the configured TTS server.
     #[command(name = "test-voice")]

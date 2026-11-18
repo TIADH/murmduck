@@ -7,7 +7,12 @@ use murmduck::session::protocol::{self, Command, PROTOCOL_VERSION, Response};
 
 #[test]
 fn every_command_round_trips_through_the_wire_format() {
-    for command in [Command::Stop, Command::ReplaceSelection, Command::Status] {
+    for command in [
+        Command::Stop,
+        Command::ReplaceSelection,
+        Command::ReplaceTestVoice,
+        Command::Status,
+    ] {
         let line = protocol::encode_command(command);
         assert!(line.ends_with('\n'), "a command must be newline-delimited");
 

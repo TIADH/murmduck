@@ -17,9 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::cli::Command;
 
-use super::body::{Cancellation, SessionBody, SessionContext};
+use super::body::{Cancellation, NoopBody, SessionBody, SessionContext};
+use super::control::{ReadingKind, SessionControl};
 use super::ipc::{self, ClientError, ClientOptions, ControlServer};
 use super::lock::InstanceLock;
 use super::paths::RuntimePaths;
@@ -60,6 +63,11 @@ pub enum CommandOutcome {
     Status(SessionState),
 }
 
+#[derive(Serialize)]
+struct StatusReport {
+    state: SessionState,
+}
+
 impl CommandOutcome {
     /// Human-readable line printed by the CLI.
     pub fn report(&self) -> String {
@@ -73,18 +81,58 @@ impl CommandOutcome {
             Self::Status(state) => format!("Session status: {state}"),
         }
     }
+
+    /// Machine-readable report for `status --json`. The state is emitted with
+    /// the same PascalCase names used by the control protocol, so the wire and
+    /// CLI views of a lifecycle state cannot drift apart.
+    pub fn report_json(&self) -> String {
+        match self {
+            Self::Status(state) => serde_json::to_string(&StatusReport { state: *state })
+                .expect("status report is serializable"),
+            other => serde_json::json!({ "result": other.report() }).to_string(),
+        }
+    }
 }
 
 /// Route `command`, running `body` only if this invocation becomes the owner.
-pub fn run<B: SessionBody>(
+///
+/// This convenience form has a single body: a replacement command stops the
+/// current reading and the owner exits rather than starting a second one.
+/// Callers that support replacement use [`run_with_factory`].
+pub fn run<B: SessionBody + 'static>(
     paths: &RuntimePaths,
     command: Command,
     body: B,
     retry: &ClientRetry,
 ) -> Result<CommandOutcome, SessionError> {
+    let mut body = Some(body);
+    let mut factory = move |_kind: ReadingKind| -> Box<dyn SessionBody> {
+        match body.take() {
+            Some(body) => Box::new(body),
+            None => Box::new(NoopBody),
+        }
+    };
+    run_with_factory(paths, command, &mut factory, retry)
+}
+
+/// Route `command`, creating a fresh body for every reading the owner runs.
+///
+/// The owner keeps the same lock, control socket and lifecycle state while it
+/// replaces readings; each body gets a new cancellation token so a replacement
+/// is never born cancelled (spec §4, §11).
+pub fn run_with_factory<F, B>(
+    paths: &RuntimePaths,
+    command: Command,
+    mut factory: F,
+    retry: &ClientRetry,
+) -> Result<CommandOutcome, SessionError>
+where
+    F: FnMut(ReadingKind) -> B,
+    B: SessionBody,
+{
     for attempt in 0..retry.lock_attempts {
         match InstanceLock::try_acquire(&paths.lock)? {
-            Some(guard) => return handle_idle(paths, command, guard, body),
+            Some(guard) => return handle_idle(paths, command, guard, &mut factory),
             None => match ipc::send_command(&paths.socket, client_command(command), &retry.connect)
             {
                 Ok(ack) => return Ok(outcome_from_ack(command, ack.response)),
@@ -108,31 +156,48 @@ pub fn run<B: SessionBody>(
 }
 
 /// An invocation that acquired the lock: it is the owner of an idle session.
-fn handle_idle<B: SessionBody>(
+fn handle_idle<F, B>(
     paths: &RuntimePaths,
     command: Command,
     guard: InstanceLock,
-    body: B,
-) -> Result<CommandOutcome, SessionError> {
+    factory: &mut F,
+) -> Result<CommandOutcome, SessionError>
+where
+    F: FnMut(ReadingKind) -> B,
+    B: SessionBody,
+{
     match command {
         // Starting a session needs the body. `guard` is kept alive for the
         // whole run by `become_owner`.
         Command::Toggle | Command::ReadSelection | Command::TestVoice => {
-            become_owner(paths, guard, body)?;
+            let kind = match command {
+                Command::TestVoice => ReadingKind::TestVoice,
+                _ => ReadingKind::Selection,
+            };
+            become_owner(paths, guard, factory, kind)?;
             Ok(CommandOutcome::SessionRan)
         }
         // `guard` is released as this function returns: nothing was started.
         Command::Stop => Ok(CommandOutcome::Idle),
-        Command::Status => Ok(CommandOutcome::Status(SessionState::Inactive)),
+        Command::Status { .. } => Ok(CommandOutcome::Status(SessionState::Inactive)),
     }
 }
 
 /// Run a session while holding the lock and serving control commands.
-fn become_owner<B: SessionBody>(
+///
+/// A replacement stops the current body (reusing its ordered teardown), then
+/// this loop starts the next reading with a fresh cancellation. `Stop` and
+/// errors end the session; the lock and socket survive replacements.
+fn become_owner<F, B>(
     paths: &RuntimePaths,
     guard: InstanceLock,
-    mut body: B,
-) -> Result<(), SessionError> {
+    factory: &mut F,
+    initial_kind: ReadingKind,
+) -> Result<(), SessionError>
+where
+    F: FnMut(ReadingKind) -> B,
+    B: SessionBody,
+{
     // Only the lock holder may remove/replace the socket. A stale socket from
     // a crashed owner is safe to remove at this point.
     remove_stale_socket(&paths.socket)?;
@@ -144,29 +209,68 @@ fn become_owner<B: SessionBody>(
         ),
     })?;
 
-    let cancel = Cancellation::new();
     let state = Arc::new(Mutex::new(SessionState::Starting));
-    let context = SessionContext {
-        cancel: cancel.clone(),
-        state: state.clone(),
-    };
-    let mut server = ControlServer::spawn(listener, state, cancel.clone());
+    let control = SessionControl::new();
+    let mut server =
+        ControlServer::spawn_with_control(listener, Arc::clone(&state), control.clone());
 
-    // The body may fail (e.g. an empty selection). Cleanup must still run
-    // while the lock is held, so defer propagating the result until after it.
-    let result = body.run(&context);
+    let mut kind = initial_kind;
+    let mut first_error: Option<SessionError> = None;
+    let mut last_body: Option<B> = None;
+    loop {
+        if control.stop_requested() {
+            break;
+        }
+
+        // Consume a request that arrived before this reading started, so one
+        // arriving *during* it is seen on the next iteration.
+        control.clear_replace();
+        let attempt = Cancellation::new();
+        control.set_attempt(attempt.clone());
+        if control.stop_requested() {
+            attempt.cancel();
+        }
+        {
+            let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+            *guard = SessionState::Starting;
+        }
+
+        let context = SessionContext {
+            cancel: attempt,
+            state: Arc::clone(&state),
+        };
+        let mut body = factory(kind);
+        let result = body.run(&context);
+        let failed = result.is_err();
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+        last_body = Some(body);
+
+        if failed || control.stop_requested() || !control.replace_requested() {
+            break;
+        }
+        kind = control.replacement_kind();
+    }
 
     // Teardown order (spec §10): the body has already stopped accepting audio,
     // aborted the HTTP request, terminated the selection subprocess and
     // released the audio device. Only now may the socket close and the lock go.
-    cancel.cancel();
+    control.stop();
     server.shutdown();
     remove_owned_socket(&paths.socket);
-    body.record_teardown(TeardownStep::ControlSocketClosed);
+    if let Some(body) = &last_body {
+        body.record_teardown(TeardownStep::ControlSocketClosed);
+    }
     drop(guard); // release the lock only after all resources are gone
-    body.record_teardown(TeardownStep::InstanceLockReleased);
+    if let Some(body) = &last_body {
+        body.record_teardown(TeardownStep::InstanceLockReleased);
+    }
 
-    result
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Remove a stale socket file left by a crashed owner. Refuse to touch any
@@ -203,14 +307,15 @@ fn client_command(command: Command) -> WireCommand {
     match command {
         // A second `toggle` cancels the current session (spec §4).
         Command::Toggle | Command::Stop => WireCommand::Stop,
-        Command::ReadSelection | Command::TestVoice => WireCommand::ReplaceSelection,
-        Command::Status => WireCommand::Status,
+        Command::ReadSelection => WireCommand::ReplaceSelection,
+        Command::TestVoice => WireCommand::ReplaceTestVoice,
+        Command::Status { .. } => WireCommand::Status,
     }
 }
 
 fn outcome_from_ack(command: Command, response: Response) -> CommandOutcome {
     match command {
-        Command::Status => match response {
+        Command::Status { .. } => match response {
             Response::Ok { state } => CommandOutcome::Status(state),
             other => CommandOutcome::Controlled { response: other },
         },

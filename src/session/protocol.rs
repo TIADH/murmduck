@@ -19,8 +19,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum Command {
     /// Stop the active session.
     Stop,
-    /// Replace the current selection (handled in a later milestone).
+    /// Replace the current reading with a fresh PRIMARY selection.
     ReplaceSelection,
+    /// Replace the current reading with the predefined test-voice sample.
+    ReplaceTestVoice,
     /// Ask for the owner's current lifecycle state.
     Status,
 }

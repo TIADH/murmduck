@@ -169,8 +169,13 @@ fn status_is_inactive_when_idle_and_live_while_a_session_runs() {
     let dir = tempfile::tempdir().expect("temp dir");
     let paths = paths(&dir);
 
-    let idle = coordinator::run(&paths, Command::Status, NoopBody, &fast_retry())
-        .expect("status succeeds while idle");
+    let idle = coordinator::run(
+        &paths,
+        Command::Status { json: false },
+        NoopBody,
+        &fast_retry(),
+    )
+    .expect("status succeeds while idle");
     assert!(
         matches!(idle, CommandOutcome::Status(SessionState::Inactive)),
         "{idle:?}"
@@ -193,8 +198,13 @@ fn status_is_inactive_when_idle_and_live_while_a_session_runs() {
     };
     wait_until(|| started.load(Ordering::Acquire), Duration::from_secs(2));
 
-    let live = coordinator::run(&paths, Command::Status, NoopBody, &fast_retry())
-        .expect("status succeeds while active");
+    let live = coordinator::run(
+        &paths,
+        Command::Status { json: false },
+        NoopBody,
+        &fast_retry(),
+    )
+    .expect("status succeeds while active");
     assert!(
         matches!(live, CommandOutcome::Status(SessionState::Playing)),
         "{live:?}"

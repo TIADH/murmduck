@@ -27,9 +27,12 @@ where
         .finish()
 }
 
-/// Install the process-wide subscriber writing to stdout.
+/// Install the process-wide subscriber writing to stderr.
+///
+/// stdout is reserved for command results, so `status --json` emits a single
+/// clean JSON document that scripts can parse.
 pub fn init(level: LevelFilter) -> Result<(), Box<dyn Error>> {
-    tracing::subscriber::set_global_default(make_subscriber(level, io::stdout))?;
+    tracing::subscriber::set_global_default(make_subscriber(level, io::stderr))?;
     Ok(())
 }
 
