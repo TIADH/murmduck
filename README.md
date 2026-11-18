@@ -16,8 +16,9 @@ Target platform for the MVP: **Fedora, KDE Plasma, Wayland, x86_64**.
 2. With no active session, Murmduck reads the PRIMARY selection via
    `wl-paste --primary --no-newline`, validates it, and streams it to
    `POST {base_url}/audio/speech`.
-3. MP3 bytes are fed incrementally into a bounded GStreamer `appsrc` pipeline;
-   playback starts before the whole HTTP response has arrived.
+3. The server's audio bytes (MP3 or WAV, per `tts.response_format`) are fed
+   incrementally into a bounded GStreamer `appsrc` pipeline; playback starts
+   before the whole HTTP response has arrived.
 4. A second `toggle` (or `stop`) reaches the owner over a temporary Unix
    socket and cancels the request, the pipeline and the selection subprocess
    in a fixed order, then releases the lock and exits.
@@ -29,9 +30,12 @@ Audio backend decision: [`docs/adr/0001-gstreamer-streaming-audio-backend.md`](d
 - Fedora KDE Plasma Wayland (x86_64).
 - A Rust toolchain (Rust and Cargo) to install from source.
 - `wl-clipboard` (`wl-paste`) for the PRIMARY selection.
-- GStreamer with an MP3 decoder (`mpg123audiodec`) and an audio sink plugin.
+- GStreamer with an audio sink plugin, plus the decoder for your configured
+  format: `mpg123audiodec` for MP3 (from the "ugly" plugin package on Fedora) or
+  `wavparse` for WAV (from `gstreamer1-plugins-good`).
 - A reachable OpenAI-compatible streaming TTS server that returns `audio/mpeg`
-  (MP3). Authentication is optional.
+  (MP3) or `audio/wav` (WAV), matching `tts.response_format`. Authentication is
+  optional.
 
 ## Install
 
@@ -81,7 +85,7 @@ api_key_env = "MURMDUCK_API_KEY"   # omit this key for servers without auth
 model = "tts-1"
 voice = "alloy"
 speed = 1.0
-response_format = "mp3"
+response_format = "mp3"   # "mp3" (default) or "wav"
 
 [audio]
 volume = 1.0
@@ -94,6 +98,11 @@ timeout_ms = 2000
 [logging]
 level = "info"
 ```
+
+`response_format` selects what the server produces. Streaming WAV is supported
+for OpenAI-compatible servers that only emit WAV (for example VieNeu-TTS),
+including responses whose RIFF/data lengths are placeholders; playback still
+starts before synthesis finishes.
 
 If your server needs an API key, put the **value** in an environment variable
 named by `api_key_env`, and make sure that variable is present in the

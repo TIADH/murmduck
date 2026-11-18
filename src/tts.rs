@@ -1,7 +1,7 @@
 //! OpenAI-compatible streaming TTS client.
 //!
 //! This module owns only the HTTP boundary: it builds the `/audio/speech`
-//! request from configuration and streams the MP3 response bytes into a
+//! request from configuration and streams the audio response bytes into a
 //! caller-supplied [`std::io::Write`]. It has no knowledge of selection text
 //! storage or GStreamer — those stay in their own modules (spec §5).
 //!
@@ -57,7 +57,7 @@ impl fmt::Display for TtsError {
             Self::EmptyResponse => write!(f, "TTS server returned an empty audio response"),
             Self::UnexpectedContentType { value } => write!(
                 f,
-                "TTS server returned unexpected content type {value:?}; expected audio/mpeg"
+                "TTS server returned unexpected content type {value:?}; expected an audio content type"
             ),
             Self::Cancelled => write!(f, "TTS request cancelled"),
         }
@@ -113,6 +113,7 @@ impl TtsClient {
 
         let response_format = match config.response_format {
             ResponseFormat::Mp3 => "mp3",
+            ResponseFormat::Wav => "wav",
         };
 
         Ok(Self {

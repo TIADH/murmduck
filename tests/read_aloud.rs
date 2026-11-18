@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use murmduck::audio::{AudioSink, StreamConfig};
 use murmduck::cli::Command;
-use murmduck::config::{SelectionConfig, TtsConfig};
+use murmduck::config::{ResponseFormat, SelectionConfig, TtsConfig};
 use murmduck::selection::{SelectionError, SelectionSource};
 use murmduck::session::body::{
     Cancellation, NoopBody, ReadAloudSession, SessionBody, SessionContext, SessionReport,
@@ -24,21 +24,13 @@ use murmduck::session::paths::RuntimePaths;
 use murmduck::session::{SessionError, SessionState};
 use murmduck::tts::TtsError;
 
+mod common;
+use common::{wav_stream, wait_for};
+
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tone.mp3");
 
 fn fixture() -> Vec<u8> {
     std::fs::read(FIXTURE).expect("read MP3 fixture")
-}
-
-fn wait_until(condition: impl Fn() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    condition()
 }
 
 struct FakeSource {
@@ -73,6 +65,8 @@ struct ReceivedRequest {
 struct ServerConfig {
     status: u16,
     chunks: Vec<Vec<u8>>,
+    /// Declared audio type of the streamed body.
+    content_type: &'static str,
     /// When set, the server sends `chunks[0]`, waits on this receiver, then
     /// sends the rest — letting a test observe playback before the full body.
     release: Option<mpsc::Receiver<()>>,
@@ -86,6 +80,7 @@ impl ServerConfig {
         Self {
             status: 200,
             chunks,
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: None,
         }
@@ -97,6 +92,7 @@ impl ServerConfig {
         Self {
             status: 200,
             chunks,
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: Some(delay),
         }
@@ -106,6 +102,7 @@ impl ServerConfig {
         Self {
             status,
             chunks: Vec::new(),
+            content_type: "audio/mpeg",
             release: None,
             chunk_delay: None,
         }
@@ -255,7 +252,8 @@ fn serve_one(
 
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        config.content_type
     );
     for (index, chunk) in config.chunks.iter().enumerate() {
         if index == 1
@@ -315,6 +313,60 @@ fn retry() -> Retry {
             backoff: Duration::from_millis(5),
         },
     }
+}
+
+#[test]
+fn wav_response_format_reaches_both_the_tts_request_and_the_audio_pipeline() {
+    let bytes = wav_stream(1, 48_000, 24_000);
+    let midpoint = bytes.len() / 2;
+    let (release, gate) = mpsc::channel();
+    let server = FakeTtsServer::spawn(ServerConfig {
+        status: 200,
+        chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        // A WAV-only server declares `audio/wav`; this must pass the HTTP
+        // content-type gate and reach the WAV decode path.
+        content_type: "audio/wav",
+        release: Some(gate),
+        chunk_delay: None,
+    });
+    let report = Arc::new(Mutex::new(SessionReport::default()));
+    let config = TtsConfig {
+        response_format: ResponseFormat::Wav,
+        ..tts_config(&server)
+    };
+    let mut body = ReadAloudSession::new(
+        FakeSource::new("WAV selection."),
+        SelectionConfig::default(),
+        config,
+        None,
+        AudioSink::Fake,
+    )
+    .with_report(Arc::clone(&report));
+    let state = Arc::new(Mutex::new(SessionState::Starting));
+    let ctx = SessionContext {
+        cancel: Cancellation::new(),
+        state: Arc::clone(&state),
+    };
+
+    let owner = thread::spawn(move || body.run(&ctx));
+    assert!(
+        wait_for(
+            || *state.lock().expect("state lock") == SessionState::Playing,
+            Duration::from_secs(5)
+        ),
+        "WAV playback must start while the server still holds the second half"
+    );
+    release.send(()).expect("release the second half");
+    owner.join().expect("body joins").expect("WAV body succeeds");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "exactly one TTS request");
+    assert_eq!(requests[0].body["response_format"], "wav");
+
+    let report = report.lock().expect("report lock");
+    assert_eq!(report.bytes_pushed, bytes.len() as u64);
+    assert!(report.decoded_bytes > 0, "WAV audio must reach the sink");
+    server.join();
 }
 
 #[test]
@@ -392,6 +444,7 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
     let server = FakeTtsServer::spawn(ServerConfig {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        content_type: "audio/mpeg",
         release: Some(gate),
         chunk_delay: None,
     });
@@ -410,7 +463,7 @@ fn playback_starts_before_the_whole_response_has_downloaded() {
     };
 
     let owner = thread::spawn(move || body.run(&ctx));
-    let started = wait_until(
+    let started = wait_for(
         || *state.lock().expect("state lock") == SessionState::Playing,
         Duration::from_secs(5),
     );
@@ -451,7 +504,7 @@ fn a_short_first_http_chunk_does_not_stall_first_audio_by_a_second() {
     let started = Instant::now();
     let owner = thread::spawn(move || body.run(&ctx));
     assert!(
-        wait_until(
+        wait_for(
             || *state.lock().expect("state lock") == SessionState::Playing,
             Duration::from_secs(5)
         ),
@@ -480,6 +533,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
     let server = FakeTtsServer::spawn(ServerConfig {
         status: 200,
         chunks: vec![bytes[..midpoint].to_vec(), bytes[midpoint..].to_vec()],
+        content_type: "audio/mpeg",
         release: Some(gate),
         chunk_delay: None,
     });
@@ -498,7 +552,7 @@ fn the_control_socket_reports_buffering_while_the_server_is_slow() {
         thread::spawn(move || coordinator::run(&runtime, Command::Toggle, body, &retry()))
     };
 
-    let observed = wait_until(
+    let observed = wait_for(
         || {
             let paths = runtime.clone();
             match coordinator::run(&paths, Command::Status { json: false }, NoopBody, &retry()) {

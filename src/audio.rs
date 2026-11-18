@@ -1,16 +1,18 @@
-//! Progressive MP3 playback over GStreamer `appsrc`.
+//! Progressive MP3 and WAV playback over GStreamer `appsrc`.
 //!
-//! This module is the surviving, reusable output of the streaming-audio spike
-//! (issue #5). It captures the pipeline shape and the observable seams that
-//! were validated so the full audio subsystem (issue #6) can build on it.
+//! This module grew out of the streaming-audio spike (issue #5) and keeps its
+//! validated pipeline shape and observable seams. The decode chain is chosen
+//! by [`StreamFormat`]; everything downstream of it is shared.
 //!
 //! ```text
-//! appsrc (bounded, streaming) -> mpegaudioparse -> mpg123audiodec
-//!        -> audioconvert -> audioresample -> sink
+//! MP3: appsrc -> mpegaudioparse -> mpg123audiodec -> audioconvert -> audioresample -> volume -> sink
+//! WAV: appsrc -> wavparse                        -> audioconvert -> audioresample -> volume -> sink
 //! ```
 //!
-//! `mpegaudioparse` is what makes HTTP-sized chunks safe: it re-frames MPEG
-//! audio, so a frame may be split across any number of pushed buffers.
+//! `mpegaudioparse` re-frames MPEG audio so a frame may be split across any
+//! number of pushed buffers. `wavparse` demuxes streamed WAV directly, including
+//! the placeholder (`0xFFFFFFFF`) RIFF/data lengths emitted by TTS servers that
+//! do not know the final size up front.
 
 use std::error::Error;
 use std::fmt;
@@ -44,6 +46,26 @@ impl AudioSink {
             Self::Auto => "autoaudiosink",
             Self::Fake | Self::SyncedFake => "fakesink",
             Self::Factory(name) => name,
+        }
+    }
+}
+
+/// The container/encoding of the bytes fed to the player.
+///
+/// This is deliberately a playback concern, not a TTS-config concern; the
+/// conversion from the configured `ResponseFormat` lives in the `From` impl.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StreamFormat {
+    #[default]
+    Mp3,
+    Wav,
+}
+
+impl From<crate::config::ResponseFormat> for StreamFormat {
+    fn from(value: crate::config::ResponseFormat) -> Self {
+        match value {
+            crate::config::ResponseFormat::Mp3 => Self::Mp3,
+            crate::config::ResponseFormat::Wav => Self::Wav,
         }
     }
 }
@@ -137,10 +159,11 @@ struct Inner {
     started: bool,
 }
 
-/// A single streaming MP3 playback session.
+/// A single streaming playback session.
 ///
-/// All methods take `&self` so a second thread can call [`Self::cancel`] while
-/// another is blocked in [`Self::push`].
+/// Despite the historical name, [`Self::with_format`] can decode WAV as well
+/// as MP3. All methods take `&self` so a second thread can call [`Self::cancel`]
+/// while another is blocked in [`Self::push`].
 pub struct StreamingMp3Player {
     pipeline: gst::Pipeline,
     appsrc: AppSrc,
@@ -156,15 +179,54 @@ pub struct StreamingMp3Player {
 }
 
 impl StreamingMp3Player {
-    /// Build a pipeline for `sink`. No device is opened until [`Self::start`].
+    /// Build an MP3 pipeline for `sink`. No device is opened until [`Self::start`].
     pub fn new(sink: AudioSink, config: StreamConfig) -> Result<Self, AudioError> {
+        Self::with_format(sink, config, StreamFormat::Mp3)
+    }
+
+    /// Build a pipeline for `sink` that decodes `format`.
+    ///
+    /// MP3 needs framing (`mpegaudioparse`) before `mpg123audiodec`; WAV is
+    /// demuxed by `wavparse`, which accepts the placeholder RIFF/data lengths
+    /// sent by streaming TTS servers. This was verified against GStreamer
+    /// 1.28.2 with `0xFFFFFFFF` RIFF/data lengths, so no hand-rolled header
+    /// rewrite is needed. Both formats share the bounded `appsrc`,
+    /// conversion/resampling, volume and cancellation machinery below.
+    pub fn with_format(
+        sink: AudioSink,
+        config: StreamConfig,
+        format: StreamFormat,
+    ) -> Result<Self, AudioError> {
         // `gst::init` is idempotent; doing it here keeps callers from needing
         // to know that the backend is GStreamer-based.
         gst::init().map_err(|err| AudioError::Pipeline(format!("gst init: {err}")))?;
         let pipeline = gst::Pipeline::new();
-        let caps = gst::Caps::builder("audio/mpeg")
-            .field("mpegversion", 1i32)
-            .build();
+        let (caps, decode): (gst::Caps, Vec<gst::Element>) = match format {
+            StreamFormat::Mp3 => (
+                gst::Caps::builder("audio/mpeg")
+                    .field("mpegversion", 1i32)
+                    .build(),
+                vec![
+                    gst::ElementFactory::make("mpegaudioparse")
+                        .name("parser")
+                        .build()
+                        .map_err(|err| AudioError::Pipeline(format!("mpegaudioparse: {err}")))?,
+                    gst::ElementFactory::make("mpg123audiodec")
+                        .name("decoder")
+                        .build()
+                        .map_err(|err| AudioError::Pipeline(format!("mpg123audiodec: {err}")))?,
+                ],
+            ),
+            StreamFormat::Wav => (
+                gst::Caps::builder("audio/x-wav").build(),
+                vec![
+                    gst::ElementFactory::make("wavparse")
+                        .name("decoder")
+                        .build()
+                        .map_err(|err| AudioError::Pipeline(format!("wavparse: {err}")))?,
+                ],
+            ),
+        };
 
         let inner = Arc::new(Mutex::new(Inner::default()));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -203,14 +265,6 @@ impl StreamingMp3Player {
                 .build(),
         );
 
-        let parser = gst::ElementFactory::make("mpegaudioparse")
-            .name("parser")
-            .build()
-            .map_err(|err| AudioError::Pipeline(format!("mpegaudioparse: {err}")))?;
-        let decoder = gst::ElementFactory::make("mpg123audiodec")
-            .name("decoder")
-            .build()
-            .map_err(|err| AudioError::Pipeline(format!("mpg123audiodec: {err}")))?;
         let convert = gst::ElementFactory::make("audioconvert")
             .name("convert")
             .build()
@@ -234,27 +288,18 @@ impl StreamingMp3Player {
             .map_err(|err| AudioError::Pipeline(format!("volume: {err}")))?;
         volume_element.set_property("volume", f64::from(config.volume));
 
+        let mut elements: Vec<&gst::Element> = Vec::with_capacity(6 + decode.len());
+        elements.push(appsrc.upcast_ref());
+        elements.extend(decode.iter());
+        elements.push(&convert);
+        elements.push(&resample);
+        elements.push(&volume_element);
+        elements.push(&sink_element);
         pipeline
-            .add_many([
-                appsrc.upcast_ref(),
-                &parser,
-                &decoder,
-                &convert,
-                &resample,
-                &volume_element,
-                &sink_element,
-            ])
+            .add_many(&elements)
             .map_err(|err| AudioError::Pipeline(format!("add elements: {err}")))?;
-        gst::Element::link_many([
-            appsrc.upcast_ref(),
-            &parser,
-            &decoder,
-            &convert,
-            &resample,
-            &volume_element,
-            &sink_element,
-        ])
-        .map_err(|err| AudioError::Pipeline(format!("link elements: {err}")))?;
+        gst::Element::link_many(&elements)
+            .map_err(|err| AudioError::Pipeline(format!("link elements: {err}")))?;
 
         // A pad probe on the sink's input observes decoded audio for every sink
         // type (including real devices), so tests need no special sink.
@@ -339,9 +384,10 @@ impl StreamingMp3Player {
         self.check_bus()
     }
 
-    /// Feed the next chunk of the MP3 stream.
+    /// Feed the next chunk of the audio stream.
     ///
-    /// Chunk boundaries are arbitrary; `mpegaudioparse` reassembles frames.
+    /// Chunk boundaries are arbitrary: `mpegaudioparse` reassembles MPEG
+    /// frames and `wavparse` buffers the RIFF header and demuxes WAV.
     /// With a bounded `max_bytes`, this blocks until the sink has consumed
     /// enough data, providing back-pressure rather than growing memory.
     pub fn push(&self, chunk: &[u8]) -> Result<(), AudioError> {

@@ -58,11 +58,12 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// The only audio format supported by the MVP.
+/// Audio formats the TTS server can be asked to produce.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ResponseFormat {
     #[default]
     Mp3,
+    Wav,
 }
 
 /// Wrap a field's deserialization error so it names the offending dotted key.
@@ -96,8 +97,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
             .map_err(|err| de::Error::custom(format!("tts.response_format: {err}")))?;
         match value.as_str() {
             "mp3" => Ok(Self::Mp3),
+            "wav" => Ok(Self::Wav),
             other => Err(de::Error::custom(format!(
-                "unsupported tts.response_format {other:?}; only \"mp3\" is supported"
+                "unsupported tts.response_format {other:?}; expected \"mp3\" or \"wav\""
             ))),
         }
     }
