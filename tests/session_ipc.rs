@@ -347,6 +347,43 @@ fn a_flood_of_incomplete_clients_cannot_delay_a_stop_command() {
 }
 
 #[test]
+fn sequential_status_requests_do_not_accumulate_worker_handles() {
+    // A long-lived owner serving repeated commands must reap finished workers;
+    // the live-worker counters bound concurrency but not total handles retained
+    // until shutdown (review PR #10 fourth re-review V2).
+    const REQUESTS: usize = 200;
+    const MAX_RETAINED: usize = 8;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+    let mut server = ControlServer::spawn(
+        listener,
+        Arc::new(Mutex::new(SessionState::Playing)),
+        Cancellation::new(),
+    );
+
+    for _ in 0..REQUESTS {
+        let ack =
+            ipc::send_command(&socket, Command::Status, &fast_options()).expect("status delivered");
+        assert!(matches!(ack.response, Response::Ok { .. }));
+    }
+
+    // Reaping happens on the server's maintenance tick, not inline with a
+    // request, so allow a short window for it to catch up.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.retained_worker_count() > MAX_RETAINED && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let retained = server.retained_worker_count();
+    assert!(
+        retained <= MAX_RETAINED,
+        "retained {retained} worker handles after {REQUESTS} sequential status requests"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn an_oversized_frame_cannot_block_other_clients() {
     let dir = tempfile::tempdir().expect("temp dir");
     let socket = dir.path().join("control.sock");

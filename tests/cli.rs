@@ -490,3 +490,72 @@ fn invalid_config_fails_with_an_actionable_error() {
         "actionable error in {stderr:?}"
     );
 }
+
+fn write_logging_config(dir: &std::path::Path, level: &str) {
+    let config_dir = dir.join("murmduck");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!("[logging]\nlevel = \"{level}\"\n"),
+    )
+    .expect("write config");
+}
+
+/// The owner installs logging before it can read `logging.level` from the TOML.
+/// Once it loads the config, the configured level must actually take effect
+/// (review PR #10 fourth re-review V1).
+#[test]
+fn owner_honours_a_configured_debug_logging_level() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_logging_config(dir.path(), "debug");
+
+    // An isolated `toggle` wins the lock and loads config. The missing
+    // selection source ends it quickly, but config logging must already have
+    // been applied by then.
+    let output = run_isolated(&["toggle"], dir.path(), std::time::Duration::from_secs(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("configuration loaded"),
+        "logging.level = debug must enable debug events: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("murmduck starting"),
+        "info events must still be visible at debug: {stderr:?}"
+    );
+}
+
+#[test]
+fn owner_honours_a_configured_off_logging_level() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_logging_config(dir.path(), "off");
+
+    let output = run_isolated(&["toggle"], dir.path(), std::time::Duration::from_secs(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("configuration loaded"),
+        "logging.level = off must silence debug events: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("murmduck starting"),
+        "logging.level = off must silence info events: {stderr:?}"
+    );
+}
+
+#[test]
+fn control_only_commands_remain_config_free_with_off_logging() {
+    // Control routing happens before any config is read; a logging setting
+    // (or even a malformed TOML) must not change stop/status behaviour.
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_logging_config(dir.path(), "off");
+    let config = dir.path().join("murmduck").join("config.toml");
+    std::fs::write(&config, "[tts]\nspeed = 0.0\n").expect("write invalid config");
+
+    for args in [&["stop"][..], &["status"][..]] {
+        let output = run_isolated(args, dir.path(), std::time::Duration::from_secs(3));
+        assert!(
+            output.status.success(),
+            "control command {args:?} must not read config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

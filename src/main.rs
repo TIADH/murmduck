@@ -66,13 +66,15 @@ fn make_body<S: SelectionSource>(
 struct OwnerSetup {
     config: Option<config::Config>,
     api_key: Option<Option<String>>,
+    logging: logging::LoggingHandle,
 }
 
 impl OwnerSetup {
-    fn new() -> Self {
+    fn new(logging: logging::LoggingHandle) -> Self {
         Self {
             config: None,
             api_key: None,
+            logging,
         }
     }
 
@@ -81,6 +83,10 @@ impl OwnerSetup {
         if self.config.is_none() {
             let path = config::config_path()?;
             let config = config::Config::load(&path)?;
+            // Logging was installed at INFO for config-free client routing.
+            // The owner now knows its config, so honour `logging.level` before
+            // emitting any further events (review PR #10 re-review V1).
+            self.logging.set(config.logging.level_filter()?);
             tracing::debug!(path = %path.display(), "configuration loaded");
             self.config = Some(config);
         }
@@ -134,7 +140,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Minimal path for commands that only talk to a live owner. No config file is
 /// located or parsed and no credentials are resolved.
 fn run_control(command: Command) -> Result<(), Box<dyn std::error::Error>> {
-    logging::init(LevelFilter::INFO)?;
+    // Control routing must not depend on config, so the initial INFO filter is
+    // all it needs; no reload handle is required on this path.
+    let _logging = logging::init(LevelFilter::INFO)?;
     let runtime = RuntimePaths::from_env()?;
     let retry = ClientRetry::default();
     let outcome = coordinator::run(&runtime, command, NoopBody, &retry)?;
@@ -149,11 +157,14 @@ fn run_control(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 /// config/credential work is deferred to [`OwnerSetup`], which the coordinator
 /// only runs once this process has won the lock and is genuinely the owner.
 fn run_owner(command: Command) -> Result<(), Box<dyn std::error::Error>> {
-    logging::init(LevelFilter::INFO)?;
+    // Install at INFO so a control-client invocation works with an invalid
+    // TOML; the handle lets OwnerSetup apply the configured level once it wins
+    // the lock and loads config.
+    let logging = logging::init(LevelFilter::INFO)?;
     let runtime = RuntimePaths::from_env()?;
     let retry = ClientRetry::default();
 
-    let mut setup = OwnerSetup::new();
+    let mut setup = OwnerSetup::new(logging);
     let outcome =
         coordinator::run_with_fallible_factory(&runtime, command, |kind| setup.body(kind), &retry)?;
     print_outcome(command, outcome);

@@ -37,6 +37,10 @@ const MAX_WORKERS: usize = 8;
 /// connections are rejected immediately without reading a frame, so a flood of
 /// slow clients cannot grow threads without bound or stall the accept loop.
 const OVERFLOW_WORKERS: usize = 128;
+/// How often to reap finished workers while connections keep arriving. Reaping
+/// is a cheap maintenance pass (no I/O), so it is amortised over a few accepts
+/// rather than run on every connection or deferred all the way to shutdown.
+const REAP_EVERY_ACCEPTS: usize = 32;
 
 /// Retry policy for a control client.
 ///
@@ -92,6 +96,17 @@ pub struct ControlServerHandle {
 }
 
 impl ControlServerHandle {
+    /// Number of worker handles currently retained for shutdown.
+    ///
+    /// Observability seam for steady-state resource tests: a long-lived owner
+    /// must not accumulate a handle for every connection it has ever served.
+    pub fn retained_worker_count(&self) -> usize {
+        self.workers
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
+    }
+
     /// Ask the server loop to stop and wait for it and its workers to exit.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -169,10 +184,18 @@ fn serve(
     // into a hotkey delay (review T2).
     let regular = Arc::new(AtomicUsize::new(0));
     let overflow = Arc::new(AtomicUsize::new(0));
+    let mut accepts_since_reap = 0usize;
 
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Maintenance never waits for a frame: a finished worker is
+                // joined and dropped here, while live ones stay for shutdown.
+                accepts_since_reap += 1;
+                if accepts_since_reap >= REAP_EVERY_ACCEPTS {
+                    accepts_since_reap = 0;
+                    reap_finished_workers(&workers);
+                }
                 let (pool, budget) = if regular.load(Ordering::Acquire) < MAX_WORKERS {
                     (&regular, FRAME_DEADLINE)
                 } else if overflow.load(Ordering::Acquire) < OVERFLOW_WORKERS {
@@ -201,13 +224,32 @@ fn serve(
                     Err(err) => err.into_inner().push(handle),
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                // Idle ticks are the natural place to join completed workers
+                // without touching the per-connection critical path.
+                reap_finished_workers(&workers);
+                thread::sleep(POLL_INTERVAL);
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "control listener stopped accepting");
                 break;
             }
         }
     }
+}
+
+/// Join and drop finished workers, keeping only the ones still running.
+fn reap_finished_workers(workers: &Mutex<Vec<JoinHandle<()>>>) {
+    let mut list = workers.lock().unwrap_or_else(|err| err.into_inner());
+    let mut live = Vec::with_capacity(list.len());
+    for handle in list.drain(..) {
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            live.push(handle);
+        }
+    }
+    *list = live;
 }
 
 /// Read one frame and apply it, with a deadline measured from connection time.
