@@ -267,10 +267,20 @@ impl StreamingMp3Player {
     }
 
     /// Move the pipeline to PLAYING. Call before the first [`Self::push`].
+    ///
+    /// If cancellation arrives before or during the state change, the pipeline
+    /// is returned to Null and no device is left open.
     pub fn start(&self) -> Result<(), AudioError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(AudioError::Cancelled);
+        }
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|err| AudioError::Pipeline(format!("set PLAYING: {err}")))?;
+        if self.cancelled.load(Ordering::Acquire) {
+            let _ = self.pipeline.set_state(gst::State::Null);
+            return Err(AudioError::Cancelled);
+        }
         self.check_bus()
     }
 
@@ -312,11 +322,19 @@ impl StreamingMp3Player {
         self.appsrc
             .end_of_stream()
             .map_err(|err| AudioError::Push(err.to_string()))?;
-        let deadline = Some(gst::ClockTime::from_seconds(30));
+        // Poll in short slices so cancellation (which may arrive from the
+        // watchdog thread while we wait for EOS) is observed promptly instead
+        // of blocking for the whole 30 s completion deadline.
+        let slice = Some(gst::ClockTime::from_mseconds(200));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                let _ = self.pipeline.set_state(gst::State::Null);
+                return Err(AudioError::Cancelled);
+            }
             match self
                 .bus
-                .timed_pop_filtered(deadline, &[gst::MessageType::Eos, gst::MessageType::Error])
+                .timed_pop_filtered(slice, &[gst::MessageType::Eos, gst::MessageType::Error])
             {
                 Some(message) => match message.view() {
                     gst::MessageView::Eos(_) => {
@@ -334,10 +352,11 @@ impl StreamingMp3Player {
                     }
                     _ => {}
                 },
-                None => {
+                None if std::time::Instant::now() >= deadline => {
                     let _ = self.pipeline.set_state(gst::State::Null);
                     return Err(AudioError::Timeout);
                 }
+                None => {}
             }
         }
         self.pipeline

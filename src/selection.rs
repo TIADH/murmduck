@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cancellation::Cancellation;
 use crate::config::SelectionConfig;
 use crate::logging;
 
@@ -36,6 +37,9 @@ pub enum SelectionError {
     Spawn { detail: String },
     /// Reading the provider's output failed.
     Io { detail: String },
+    /// The session was cancelled while the provider was running; the process
+    /// was terminated and reaped.
+    Cancelled,
 }
 
 impl fmt::Display for SelectionError {
@@ -61,6 +65,7 @@ impl fmt::Display for SelectionError {
                 write!(f, "could not start selection provider: {detail}")
             }
             Self::Io { detail } => write!(f, "error reading selection provider: {detail}"),
+            Self::Cancelled => write!(f, "selection reading cancelled"),
         }
     }
 }
@@ -75,6 +80,13 @@ impl Error for SelectionError {}
 pub trait SelectionSource {
     /// Read the raw text currently held in the PRIMARY selection.
     fn read_text(&self) -> Result<String, SelectionError>;
+
+    /// Read while watching `cancel`. Sources with a subprocess override this
+    /// so cancellation terminates the child; simple sources keep the default.
+    fn read_text_cancellable(&self, cancel: &Cancellation) -> Result<String, SelectionError> {
+        let _ = cancel;
+        self.read_text()
+    }
 }
 
 /// Validated text read from the PRIMARY selection.
@@ -134,6 +146,31 @@ pub fn read_selection(
     Ok(Selection { text })
 }
 
+/// Cancellation-aware counterpart to [`read_selection`]. A cancelled read
+/// reports [`SelectionError::Cancelled`] and guarantees the provider process
+/// has been terminated and reaped before returning.
+pub fn read_selection_cancellable(
+    source: &dyn SelectionSource,
+    config: &SelectionConfig,
+    cancel: &Cancellation,
+) -> Result<Selection, SelectionError> {
+    let text = source.read_text_cancellable(cancel)?;
+
+    if text.is_empty() {
+        return Err(SelectionError::Empty);
+    }
+    let char_count = text.chars().count();
+    if char_count > config.max_chars {
+        return Err(SelectionError::TooLong {
+            max: config.max_chars,
+            actual: char_count,
+        });
+    }
+
+    logging::log_selection_summary(&text);
+    Ok(Selection { text })
+}
+
 /// Build the human-readable, text-free report for a successful read.
 ///
 /// Only the character count is included; the selected text is never part of
@@ -149,6 +186,9 @@ pub fn success_report(selection: &Selection) -> String {
 /// Provider diagnostics are safe to include (they never contain the selection),
 /// but bounding them keeps errors readable.
 const STDERR_DETAIL_LIMIT: usize = 200;
+
+/// How often a cancellable read re-checks the signal while waiting on output.
+const CANCEL_POLL: Duration = Duration::from_millis(10);
 
 /// A [`SelectionSource`] backed by an external selection-provider subprocess.
 ///
@@ -201,6 +241,19 @@ impl WaylandPrimary {
 
 impl SelectionSource for WaylandPrimary {
     fn read_text(&self) -> Result<String, SelectionError> {
+        self.read_text_inner(None)
+    }
+
+    fn read_text_cancellable(&self, cancel: &Cancellation) -> Result<String, SelectionError> {
+        self.read_text_inner(Some(cancel))
+    }
+}
+
+impl WaylandPrimary {
+    fn read_text_inner(&self, cancel: Option<&Cancellation>) -> Result<String, SelectionError> {
+        if cancel.is_some_and(|signal| signal.is_cancelled()) {
+            return Err(SelectionError::Cancelled);
+        }
         let mut child = self.spawn().map_err(|err| SelectionError::Spawn {
             detail: err.to_string(),
         })?;
@@ -220,12 +273,16 @@ impl SelectionSource for WaylandPrimary {
             .checked_add(self.timeout)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         let stdout_bytes = loop {
+            if cancel.is_some_and(|signal| signal.is_cancelled()) {
+                kill_and_reap(&mut child);
+                return Err(SelectionError::Cancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 kill_and_reap(&mut child);
                 return Err(self.timeout_error());
             }
-            match stdout_rx.recv_timeout(remaining) {
+            match stdout_rx.recv_timeout(remaining.min(CANCEL_POLL)) {
                 Ok(Ok(bytes)) => break bytes,
                 Ok(Err(err)) => {
                     kill_and_reap(&mut child);
@@ -248,6 +305,10 @@ impl SelectionSource for WaylandPrimary {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
+                    if cancel.is_some_and(|signal| signal.is_cancelled()) {
+                        kill_and_reap(&mut child);
+                        return Err(SelectionError::Cancelled);
+                    }
                     if Instant::now() >= deadline {
                         kill_and_reap(&mut child);
                         return Err(self.timeout_error());

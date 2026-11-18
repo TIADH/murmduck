@@ -10,62 +10,17 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{AudioError, AudioSink, PlayerEvent, StreamConfig, StreamingMp3Player};
 use crate::config::{SelectionConfig, TtsConfig};
-use crate::selection::{self, SelectionSource};
-use crate::session::{SessionError, SessionState};
-use crate::tts::TtsClient;
+use crate::selection::{self, SelectionError, SelectionSource};
+use crate::session::{SessionError, SessionState, TeardownStep};
+use crate::tts::{TtsClient, TtsError};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Re-exported so existing callers keep using `session::body::Cancellation`; the
+// primitive itself lives in a neutral module that selection and TTS also use.
+pub use crate::cancellation::Cancellation;
 
-/// Shared cancellation signal. `Clone` handles all point at the same flag.
-#[derive(Debug, Clone)]
-pub struct Cancellation {
-    flag: Arc<AtomicBool>,
-}
-
-impl Cancellation {
-    pub fn new() -> Self {
-        Self {
-            flag: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
-    }
-
-    /// Request cancellation of the running session.
-    pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Release);
-    }
-
-    /// Wait until cancelled or `timeout` elapses. Returns `true` if cancelled.
-    ///
-    /// `Duration::MAX` is handled without overflowing `Instant`.
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now().checked_add(timeout);
-        loop {
-            if self.is_cancelled() {
-                return true;
-            }
-            match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return false;
-                    }
-                    thread::sleep(remaining.min(POLL_INTERVAL));
-                }
-                None => thread::sleep(POLL_INTERVAL),
-            }
-        }
-    }
-}
-
-impl Default for Cancellation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Hook invoked during audio-pipeline initialisation (see
+/// [`ReadAloudSession::with_init_hook`]).
+type InitHook = Arc<dyn Fn(&SessionContext) + Send + Sync>;
 
 /// Values a running body can read and update while it works.
 #[derive(Debug, Clone)]
@@ -93,6 +48,11 @@ impl SessionContext {
 /// commands. A body returns when its work completes or `ctx.cancel` is set.
 pub trait SessionBody: Send {
     fn run(&mut self, ctx: &SessionContext) -> Result<(), SessionError>;
+
+    /// Record one teardown step for observers. Bodies that own no resources
+    /// can keep the default; the coordinator still records the socket/lock
+    /// steps on the same log.
+    fn record_teardown(&self, _step: TeardownStep) {}
 }
 
 /// A body that starts and immediately finishes. Used by commands (`stop`,
@@ -161,6 +121,14 @@ pub struct SessionReport {
     pub states: Vec<SessionState>,
     pub bytes_pushed: u64,
     pub decoded_bytes: u64,
+    /// Ordered teardown steps, used by tests to verify deterministic cleanup.
+    pub teardown: Vec<TeardownStep>,
+    /// Number of audio pipelines currently live, and the high-water mark.
+    /// Shared across bodies so overlapping sessions are detectable.
+    pub active_players: i32,
+    pub peak_active_players: i32,
+    /// True once `cancel()` has returned both pipeline and sink to Null.
+    pub audio_torn_down: bool,
 }
 
 /// Publish a state both to the live session (for `status` clients) and to the
@@ -172,6 +140,91 @@ fn publish(ctx: &SessionContext, report: &Option<Arc<Mutex<SessionReport>>>, sta
     {
         guard.states.push(state);
     }
+}
+
+fn record_teardown_step(report: &Option<Arc<Mutex<SessionReport>>>, step: TeardownStep) {
+    if let Some(report) = report
+        && let Ok(mut guard) = report.lock()
+    {
+        guard.teardown.push(step);
+    }
+}
+
+fn player_opened(report: &Option<Arc<Mutex<SessionReport>>>) {
+    if let Some(report) = report
+        && let Ok(mut guard) = report.lock()
+    {
+        guard.active_players += 1;
+        guard.peak_active_players = guard.peak_active_players.max(guard.active_players);
+    }
+}
+
+fn player_closed(report: &Option<Arc<Mutex<SessionReport>>>, player: &StreamingMp3Player) {
+    if let Some(report) = report
+        && let Ok(mut guard) = report.lock()
+    {
+        guard.active_players -= 1;
+        guard.audio_torn_down = player.is_torn_down();
+    }
+}
+
+/// Watches cancellation from a separate thread and stops the pipeline so a
+/// `push()` blocked on GStreamer back-pressure unblocks immediately. Without
+/// this, a slow sink could keep the body alive long after `toggle` was answered.
+struct PipelineWatchdog {
+    done: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PipelineWatchdog {
+    fn spawn(player: Arc<StreamingMp3Player>, cancel: Cancellation) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let guard_done = Arc::clone(&done);
+        let thread = thread::spawn(move || {
+            while !guard_done.load(Ordering::Acquire) {
+                if cancel.is_cancelled() {
+                    // `cancel()` is idempotent; return right after the first
+                    // call so a stuck push is unblocked exactly once.
+                    player.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PipelineWatchdog {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
+/// Stop the pipeline, release the device and record those steps in order.
+fn stop_pipeline(report: &Option<Arc<Mutex<SessionReport>>>, player: &StreamingMp3Player) {
+    player.cancel();
+    record_teardown_step(report, TeardownStep::AudioPipelineStopped);
+    player_closed(report, player);
+}
+
+/// Run the full cancellation teardown in the spec's order (§10). Steps whose
+/// resource does not exist at this stage are still recorded as no-ops so the
+/// sequence is deterministic and observable.
+fn record_cancel_teardown(report: &Option<Arc<Mutex<SessionReport>>>, player: &StreamingMp3Player) {
+    record_teardown_step(report, TeardownStep::StoppedAcceptingAudio);
+    record_teardown_step(report, TeardownStep::HttpRequestCancelled);
+    stop_pipeline(report, player);
 }
 
 /// Bridges the TTS client's streaming `Write` sink to the audio player.
@@ -210,9 +263,18 @@ impl Write for AudioSinkWriter<'_> {
             let deadline = *self
                 .start_deadline
                 .get_or_insert_with(|| Instant::now() + Duration::from_millis(1_000));
-            while Instant::now() < deadline && !self.player.events().contains(&PlayerEvent::Started)
+            while Instant::now() < deadline
+                && !self.ctx.cancel.is_cancelled()
+                && !self.player.events().contains(&PlayerEvent::Started)
             {
                 thread::sleep(Duration::from_millis(2));
+            }
+            if self.ctx.cancel.is_cancelled() {
+                self.cancelled = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "session cancelled",
+                ));
             }
             if self.player.events().contains(&PlayerEvent::Started) {
                 self.playing = true;
@@ -240,6 +302,9 @@ pub struct ReadAloudSession<S> {
     sink: AudioSink,
     stream_config: StreamConfig,
     report: Option<Arc<Mutex<SessionReport>>>,
+    /// Invoked between pipeline construction and `start()`; lets tests drive
+    /// cancellation at the most delicate point of initialisation.
+    init_hook: Option<InitHook>,
 }
 
 impl<S: SelectionSource> ReadAloudSession<S> {
@@ -258,6 +323,7 @@ impl<S: SelectionSource> ReadAloudSession<S> {
             sink,
             stream_config: StreamConfig::default(),
             report: None,
+            init_hook: None,
         }
     }
 
@@ -272,13 +338,32 @@ impl<S: SelectionSource> ReadAloudSession<S> {
         self.report = Some(report);
         self
     }
+
+    /// Run `hook` after the audio pipeline is built but before it starts.
+    /// Tests use this to cancel deterministically during initialisation.
+    pub fn with_init_hook(
+        mut self,
+        hook: impl Fn(&SessionContext) + Send + Sync + 'static,
+    ) -> Self {
+        self.init_hook = Some(Arc::new(hook));
+        self
+    }
 }
 
 impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
     fn run(&mut self, ctx: &SessionContext) -> Result<(), SessionError> {
         // Starting (set by the coordinator): read and validate the selection.
-        let selected = match selection::read_selection(&self.source, &self.selection_config) {
+        let selected = match selection::read_selection_cancellable(
+            &self.source,
+            &self.selection_config,
+            &ctx.cancel,
+        ) {
             Ok(selected) => selected,
+            Err(SelectionError::Cancelled) => {
+                self.record_teardown(TeardownStep::SelectionProcessTerminated);
+                publish(ctx, &self.report, SessionState::Stopping);
+                return Ok(());
+            }
             Err(err) => {
                 publish(ctx, &self.report, SessionState::Stopping);
                 return Err(SessionError::Selection(err));
@@ -301,13 +386,46 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
         // Connecting: send the TTS request and begin receiving audio.
         publish(ctx, &self.report, SessionState::Connecting);
 
-        let player = StreamingMp3Player::new(self.sink.clone(), self.stream_config)
-            .map_err(SessionError::Audio)?;
-        if let Err(err) = player.start() {
-            player.cancel();
-            publish(ctx, &self.report, SessionState::Stopping);
-            return Err(SessionError::Audio(err));
+        // Cancellation can arrive while Connecting is published or while the
+        // pipeline is being constructed; either way the pipeline is torn down
+        // through the same ordered path as a cancellation during streaming.
+        let player = Arc::new(
+            StreamingMp3Player::new(self.sink.clone(), self.stream_config)
+                .map_err(SessionError::Audio)?,
+        );
+        player_opened(&self.report);
+
+        if let Some(hook) = &self.init_hook {
+            hook(ctx);
         }
+        if ctx.cancel.is_cancelled() {
+            record_cancel_teardown(&self.report, &player);
+            publish(ctx, &self.report, SessionState::Stopping);
+            return Ok(());
+        }
+        match player.start() {
+            Ok(()) => {}
+            Err(AudioError::Cancelled) => {
+                record_cancel_teardown(&self.report, &player);
+                publish(ctx, &self.report, SessionState::Stopping);
+                return Ok(());
+            }
+            Err(err) => {
+                stop_pipeline(&self.report, &player);
+                publish(ctx, &self.report, SessionState::Stopping);
+                return Err(SessionError::Audio(err));
+            }
+        }
+        if ctx.cancel.is_cancelled() {
+            record_cancel_teardown(&self.report, &player);
+            publish(ctx, &self.report, SessionState::Stopping);
+            return Ok(());
+        }
+
+        // Only now, with the pipeline fully started, does the watchdog begin
+        // watching for cancellation: its job is to unblock a `push()` stalled
+        // on back-pressure, not to race `start()`'s state change.
+        let mut watchdog = PipelineWatchdog::spawn(Arc::clone(&player), ctx.cancel.clone());
 
         // Buffering: audio is arriving but has not reached the sink yet.
         publish(ctx, &self.report, SessionState::Buffering);
@@ -321,20 +439,29 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
             cancelled: false,
             audio_error: None,
         };
-        let stream_result = client.speak_to(selected.text(), &mut writer);
+        let stream_result = client.speak_to_cancellable(selected.text(), &mut writer, &ctx.cancel);
 
-        if writer.cancelled {
-            player.cancel();
+        // Cancellation wins over follow-on errors: once Stop arrives the HTTP
+        // request has been aborted and the watchdog has stopped the pipeline,
+        // so an `Interrupted` write or `Cancelled` push is not an error.
+        let cancelled = ctx.cancel.is_cancelled()
+            || writer.cancelled
+            || matches!(stream_result, Err(TtsError::Cancelled));
+        if cancelled {
+            watchdog.disarm();
+            record_cancel_teardown(&self.report, &player);
             publish(ctx, &self.report, SessionState::Stopping);
             return Ok(());
         }
         if let Some(err) = writer.audio_error.take() {
-            player.cancel();
+            watchdog.disarm();
+            stop_pipeline(&self.report, &player);
             publish(ctx, &self.report, SessionState::Stopping);
             return Err(SessionError::Audio(err));
         }
         if let Err(err) = stream_result {
-            player.cancel();
+            watchdog.disarm();
+            stop_pipeline(&self.report, &player);
             publish(ctx, &self.report, SessionState::Stopping);
             return Err(SessionError::Tts(err));
         }
@@ -346,8 +473,15 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
 
         let stats = match player.finish() {
             Ok(stats) => stats,
+            Err(AudioError::Cancelled) => {
+                watchdog.disarm();
+                record_cancel_teardown(&self.report, &player);
+                publish(ctx, &self.report, SessionState::Stopping);
+                return Ok(());
+            }
             Err(err) => {
-                player.cancel();
+                watchdog.disarm();
+                stop_pipeline(&self.report, &player);
                 publish(ctx, &self.report, SessionState::Stopping);
                 return Err(SessionError::Audio(err));
             }
@@ -360,8 +494,15 @@ impl<S: SelectionSource + Send> SessionBody for ReadAloudSession<S> {
         }
 
         // Stopping: `finish()` already returned the pipeline to Null; the
-        // coordinator releases the lock and control socket on our return.
+        // coordinator releases the control socket and lock on our return.
+        watchdog.disarm();
+        record_teardown_step(&self.report, TeardownStep::AudioPipelineStopped);
+        player_closed(&self.report, &player);
         publish(ctx, &self.report, SessionState::Stopping);
         Ok(())
+    }
+
+    fn record_teardown(&self, step: TeardownStep) {
+        record_teardown_step(&self.report, step);
     }
 }

@@ -24,7 +24,7 @@ use super::ipc::{self, ClientError, ClientOptions, ControlServer};
 use super::lock::InstanceLock;
 use super::paths::RuntimePaths;
 use super::protocol::{Command as WireCommand, Response};
-use super::{SessionError, SessionState};
+use super::{SessionError, SessionState, TeardownStep};
 
 /// Retry policy used while looking for a live owner.
 #[derive(Debug, Clone)]
@@ -156,10 +156,15 @@ fn become_owner<B: SessionBody>(
     // while the lock is held, so defer propagating the result until after it.
     let result = body.run(&context);
 
+    // Teardown order (spec §10): the body has already stopped accepting audio,
+    // aborted the HTTP request, terminated the selection subprocess and
+    // released the audio device. Only now may the socket close and the lock go.
     cancel.cancel();
     server.shutdown();
     remove_owned_socket(&paths.socket);
+    body.record_teardown(TeardownStep::ControlSocketClosed);
     drop(guard); // release the lock only after all resources are gone
+    body.record_teardown(TeardownStep::InstanceLockReleased);
 
     result
 }

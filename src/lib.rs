@@ -5,6 +5,7 @@
 //! and structured logging that those modules build on.
 
 pub mod audio;
+pub mod cancellation;
 pub mod cli;
 pub mod config;
 pub mod logging;

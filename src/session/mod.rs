@@ -122,3 +122,16 @@ impl std::fmt::Display for SessionState {
         f.write_str(name)
     }
 }
+
+/// Ordered steps of a session teardown (spec §10). The coordinator records
+/// the last two; the body records the rest. Exposed so tests can assert that
+/// resources are released in the required order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownStep {
+    StoppedAcceptingAudio,
+    HttpRequestCancelled,
+    SelectionProcessTerminated,
+    AudioPipelineStopped,
+    ControlSocketClosed,
+    InstanceLockReleased,
+}
